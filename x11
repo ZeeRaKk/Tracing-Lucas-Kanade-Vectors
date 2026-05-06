@@ -1,245 +1,33 @@
-# ============================================================
-# Blocage des raccourcis clavier Chrome via xbindkeys
-# Grabs GLOBAUX (pas spécifiques à Chrome).
-# Installation : cp dans ~/.xbindkeysrc puis xbindkeys -n -v
-# ============================================================
+; Bloque tous les Ctrl+<touche>
+; Couvre les 8 combinaisons de lock-modifiers pour être robuste
 
-# --- Gestion onglets / fenêtres -----------------------------
-"true"
-    Control + t
-"true"
-    Control + w
-"true"
-    Control + n
-"true"
-    Control + q
-"true"
-    Control+Shift + t
-"true"
-    Control+Shift + n
-"true"
-    Control+Shift + w
-"true"
-    Control+Shift + q
-"true"
-    Control + Tab
-"true"
-    Control+Shift + Tab
-"true"
-    Control + Page_Up
-"true"
-    Control + Page_Down
+(define lock-combos
+  (list
+    '()
+    '(mod2)      ; NumLock
+    '(lock)      ; CapsLock
+    '(mod5)      ; ScrollLock
+    '(mod2 lock)
+    '(mod2 mod5)
+    '(lock mod5)
+    '(mod2 lock mod5)))
 
-# --- Saut direct onglets 1-9 --------------------------------
-"true"
-    Control + 1
-"true"
-    Control + 2
-"true"
-    Control + 3
-"true"
-    Control + 4
-"true"
-    Control + 5
-"true"
-    Control + 6
-"true"
-    Control + 7
-"true"
-    Control + 8
-"true"
-    Control + 9
+(define all-keys
+  '("a" "b" "c" "d" "e" "f" "g" "h" "i" "j" "k" "l" "m"
+    "n" "o" "p" "q" "r" "s" "t" "u" "v" "w" "x" "y" "z"
+    "0" "1" "2" "3" "4" "5" "6" "7" "8" "9"
+    "F1" "F2" "F3" "F4" "F5" "F6" "F7" "F8" "F9" "F10" "F11" "F12"
+    "Tab" "Return" "Escape" "BackSpace" "Delete" "space"
+    "Up" "Down" "Left" "Right"
+    "Home" "End" "Page_Up" "Page_Down"
+    "Insert" "plus" "minus" "equal" "KP_Add" "KP_Subtract"
+    "bracketleft" "bracketright" "semicolon" "apostrophe"
+    "comma" "period" "slash" "backslash" "grave"))
 
-# --- Barre d'adresse / recherche ----------------------------
-"true"
-    Control + l
-"true"
-    Control + e
-"true"
-    Control + k
-"true"
-    Alt + d
-
-# --- Navigation ---------------------------------------------
-"true"
-    Alt + Left
-"true"
-    Alt + Right
-"true"
-    Alt + Home
-"true"
-    Control + r
-"true"
-    Control+Shift + r
-
-# --- Recherche dans la page ---------------------------------
-"true"
-    Control + f
-"true"
-    Control + g
-"true"
-    Control+Shift + g
-
-# --- Historique / téléchargements / favoris -----------------
-"true"
-    Control + h
-"true"
-    Control + j
-"true"
-    Control + d
-"true"
-    Control+Shift + d
-"true"
-    Control+Shift + b
-"true"
-    Control+Shift + o
-"true"
-    Control+Shift + a
-
-# --- Fichiers -----------------------------------------------
-"true"
-    Control + o
-"true"
-    Control + s
-"true"
-    Control + p
-"true"
-    Control + u
-
-# --- DevTools ----------------------------------------------
-"true"
-    Control+Shift + i
-"true"
-    Control+Shift + j
-"true"
-    Control+Shift + c
-
-# --- Données privées / profils ------------------------------
-"true"
-    Control+Shift + Delete
-"true"
-    Control+Shift + m
-
-# --- Zoom ---------------------------------------------------
-"true"
-    Control + 0
-"true"
-    Control + plus
-"true"
-    Control + equal
-"true"
-    Control + minus
-"true"
-    Control + KP_Add
-"true"
-    Control + KP_Subtract
-
-# --- Menus --------------------------------------------------
-"true"
-    Alt + e
-"true"
-    Alt + f
-
-# --- Touches F1 à F12 nues ---------------------------------
-"true"
-    F1
-"true"
-    F2
-"true"
-    F3
-"true"
-    F4
-"true"
-    F5
-"true"
-    F6
-"true"
-    F7
-"true"
-    F8
-"true"
-    F9
-"true"
-    F10
-"true"
-    F11
-"true"
-    F12
-
-# --- Alt + F1 à F12 (inclut Alt+F4 pour fermer fenêtre) -----
-"true"
-    Alt + F1
-"true"
-    Alt + F2
-"true"
-    Alt + F3
-"true"
-    Alt + F4
-"true"
-    Alt + F5
-"true"
-    Alt + F6
-"true"
-    Alt + F7
-"true"
-    Alt + F8
-"true"
-    Alt + F9
-"true"
-    Alt + F10
-"true"
-    Alt + F11
-"true"
-    Alt + F12
-
-# --- Ctrl + F1 à F12 ---------------------------------------
-"true"
-    Control + F1
-"true"
-    Control + F2
-"true"
-    Control + F3
-"true"
-    Control + F4
-"true"
-    Control + F5
-"true"
-    Control + F6
-"true"
-    Control + F7
-"true"
-    Control + F8
-"true"
-    Control + F9
-"true"
-    Control + F10
-"true"
-    Control + F11
-"true"
-    Control + F12
-
-# --- Shift + F1 à F12 --------------------------------------
-"true"
-    Shift + F1
-"true"
-    Shift + F2
-"true"
-    Shift + F3
-"true"
-    Shift + F4
-"true"
-    Shift + F5
-"true"
-    Shift + F6
-"true"
-    Shift + F7
-"true"
-    Shift + F8
-"true"
-    Shift + F9
-"true"
-    Shift + F10
-"true"
-    Shift + F11
-"true"
-    Shift + F12
+(for-each
+  (lambda (locks)
+    (for-each
+      (lambda (key)
+        (xbindkey (append (list 'control) locks (list key)) "true"))
+      all-keys))
+  lock-combos)
