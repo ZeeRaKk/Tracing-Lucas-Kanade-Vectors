@@ -1,479 +1,219 @@
-# Projet complet : Keycloak + Apache mod_auth_openidc
-
-Chaque section ci-dessous correspond à un fichier.
-Le chemin est indiqué en titre, il suffit de créer le fichier au bon endroit.
-
-```
-tuto-keycloak-apache/
-├── docker-compose.yml
-├── README.md
-├── .gitignore
-├── apache/
-│   ├── Dockerfile
-│   ├── openidc.conf
-│   └── vhost.conf
-└── apps/
-    ├── app1/
-    │   ├── Dockerfile
-    │   └── server.py
-    └── app2/
-        ├── Dockerfile
-        └── server.py
-```
-
----
-
-## `docker-compose.yml`
-
-```yaml
-version: "3.8"
-
-services:
-  # ============================================================
-  # Keycloak - Identity Provider
-  # ============================================================
-  keycloak-db:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_DB: keycloak
-      POSTGRES_USER: keycloak
-      POSTGRES_PASSWORD: keycloak_db_pass
-    volumes:
-      - keycloak_db_data:/var/lib/postgresql/data
-    networks:
-      - backend
-
-  keycloak:
-    image: quay.io/keycloak/keycloak:24.0
-    command: start-dev
-    environment:
-      KC_DB: postgres
-      KC_DB_URL: jdbc:postgresql://keycloak-db:5432/keycloak
-      KC_DB_USERNAME: keycloak
-      KC_DB_PASSWORD: keycloak_db_pass
-      KEYCLOAK_ADMIN: admin
-      KEYCLOAK_ADMIN_PASSWORD: admin
-      KC_PROXY_HEADERS: xforwarded
-      KC_HTTP_ENABLED: "true"
-      KC_HOSTNAME_STRICT: "false"
-    ports:
-      - "8080:8080"
-    depends_on:
-      - keycloak-db
-    networks:
-      - backend
-
-  # ============================================================
-  # Apache - Reverse Proxy + mod_auth_openidc
-  # ============================================================
-  apache:
-    build:
-      context: ./apache
-      dockerfile: Dockerfile
-    ports:
-      - "443:443"
-      - "80:80"
-    volumes:
-      - ./apache/vhost.conf:/etc/apache2/sites-enabled/000-default.conf:ro
-      - ./apache/openidc.conf:/etc/apache2/conf-enabled/openidc.conf:ro
-    depends_on:
-      - keycloak
-      - app1
-      - app2
-    networks:
-      - backend
-
-  # ============================================================
-  # Applications de démo
-  # ============================================================
-  app1:
-    build:
-      context: ./apps/app1
-    networks:
-      - backend
-
-  app2:
-    build:
-      context: ./apps/app2
-    networks:
-      - backend
-
-volumes:
-  keycloak_db_data:
-
-networks:
-  backend:
-    driver: bridge
-```
-
----
-
-## `apache/Dockerfile`
-
-```dockerfile
-FROM debian:bookworm-slim
-
-RUN apt-get update && apt-get install -y \
-    apache2 \
-    libapache2-mod-auth-openidc \
-    && rm -rf /var/lib/apt/lists/*
-
-# Activer les modules nécessaires
-RUN a2enmod auth_openidc proxy proxy_http headers rewrite ssl
-
-# Désactiver le site par défaut (on le remplace)
-RUN a2dissite 000-default || true
-
-EXPOSE 80
-
-CMD ["apachectl", "-D", "FOREGROUND"]
-```
-
----
-
-## `apache/openidc.conf`
-
-```apache
-# =============================================================
-# mod_auth_openidc - Configuration globale
-# =============================================================
-
-# Point d'entrée OpenID Connect (Keycloak)
-# IMPORTANT : Cette URL doit être accessible depuis le conteneur Apache
-OIDCProviderMetadataURL http://keycloak:8080/realms/demo/.well-known/openid-configuration
-
-# Identifiants du client OIDC (à créer dans Keycloak)
-OIDCClientID apache-proxy
-OIDCClientSecret changeme-secret-12345
-
-# URI de callback - doit correspondre à un "Valid Redirect URI" dans Keycloak
-# C'est l'URL où Keycloak redirige après authentification
-OIDCRedirectURI http://localhost/redirect_uri
-
-# Passphrase pour chiffrer les cookies de session
-OIDCCryptoPassphrase une-passphrase-longue-et-aleatoire-a-changer
-
-# ---- Sessions ----
-# Stockage serveur (nécessaire pour le back-channel logout)
-OIDCSessionType server-cache
-OIDCSessionInactivityTimeout 3600
-OIDCSessionMaxDuration 28800
-
-# ---- Back-Channel Logout ----
-# Keycloak enverra un POST ici pour invalider les sessions
-OIDCBackChannelLogoutURL http://localhost/backchannel-logout
-
-# ---- Claims et headers ----
-# Injecter les claims du token dans les headers HTTP vers les apps
-OIDCPassClaimsAs headers
-
-# Scopes demandés à Keycloak
-OIDCScope "openid email profile"
-
-# ---- Sécurité ----
-# Empêcher les clients de forger les headers OIDC
-OIDCStripCookies mod_auth_openidc_session
-```
-
----
-
-## `apache/vhost.conf`
-
-```apache
-<VirtualHost *:80>
-    ServerName localhost
-
-    # ==========================================================
-    # Sécurité : supprimer les headers OIDC forgés par le client
-    # ==========================================================
-    RequestHeader unset OIDC_CLAIM_preferred_username
-    RequestHeader unset OIDC_CLAIM_email
-    RequestHeader unset OIDC_CLAIM_name
-    RequestHeader unset OIDC_CLAIM_sub
-    RequestHeader unset OIDC_CLAIM_realm_access
-    RequestHeader unset REMOTE_USER
-
-    # ==========================================================
-    # Page d'accueil (non protégée)
-    # ==========================================================
-    <Location />
-        # Pas d'auth ici - page publique
-        Require all granted
-    </Location>
-
-    # ==========================================================
-    # App 1 - Accessible à tous les utilisateurs authentifiés
-    # ==========================================================
-    <Location /app1/>
-        AuthType openid-connect
-        Require valid-user
-
-        ProxyPass         http://app1:3001/
-        ProxyPassReverse  http://app1:3001/
-    </Location>
-
-    # ==========================================================
-    # App 2 - Accessible uniquement aux utilisateurs avec le rôle "admin"
-    # ==========================================================
-    <Location /app2/>
-        AuthType openid-connect
-        Require claim realm_access.roles:admin
-
-        ProxyPass         http://app2:3002/
-        ProxyPassReverse  http://app2:3002/
-    </Location>
-
-    # ==========================================================
-    # Endpoint de callback OIDC (ne pas toucher)
-    # ==========================================================
-    <Location /redirect_uri>
-        AuthType openid-connect
-        Require valid-user
-    </Location>
-
-    # ==========================================================
-    # Endpoint de logout
-    # ==========================================================
-    <Location /logout>
-        AuthType openid-connect
-        Require valid-user
-        # Redirige vers la déconnexion Keycloak puis retour à /
-        OIDCUnAuthAction 302:/
-    </Location>
-
-    # ==========================================================
-    # Infos de debug (à retirer en production)
-    # ==========================================================
-    <Location /userinfo>
-        AuthType openid-connect
-        Require valid-user
-
-        ProxyPass         http://app1:3001/userinfo
-        ProxyPassReverse  http://app1:3001/userinfo
-    </Location>
-
-    # Logs
-    ErrorLog ${APACHE_LOG_DIR}/error.log
-    CustomLog ${APACHE_LOG_DIR}/access.log combined
-    LogLevel debug
-
-</VirtualHost>
-```
-
----
-
-## `apps/app1/Dockerfile`
-
-```dockerfile
-FROM python:3.12-slim
-WORKDIR /app
-COPY server.py .
-EXPOSE 3001
-CMD ["python", "server.py"]
-```
-
----
-
-## `apps/app1/server.py`
-
-```python
-"""
-App 1 - Démo : affiche les informations utilisateur reçues de mod_auth_openidc.
-L'app ne gère aucune authentification elle-même.
-Elle fait confiance aux headers injectés par Apache.
-"""
-
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import json
-
-HTML_TEMPLATE = """<!DOCTYPE html>
-<html lang="fr">
-<head>
-    <meta charset="utf-8">
-    <title>App 1 - Dashboard</title>
-    <style>
-        body {{ font-family: system-ui, sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; background: #f5f5f5; }}
-        .card {{ background: white; border-radius: 8px; padding: 24px; margin: 16px 0; box-shadow: 0 1px 3px rgba(0,0,0,0.12); }}
-        h1 {{ color: #2563eb; }}
-        .user-badge {{ background: #dbeafe; color: #1e40af; padding: 4px 12px; border-radius: 16px; font-weight: 600; }}
-        table {{ width: 100%; border-collapse: collapse; }}
-        td {{ padding: 8px; border-bottom: 1px solid #e5e7eb; }}
-        td:first-child {{ font-weight: 600; color: #6b7280; width: 40%; }}
-        a.logout {{ color: #dc2626; text-decoration: none; font-weight: 600; }}
-    </style>
-</head>
-<body>
-    <div class="card">
-        <h1>App 1 - Dashboard</h1>
-        <p>Bonjour <span class="user-badge">{username}</span> !</p>
-        <p><a class="logout" href="/logout">Se déconnecter</a></p>
-    </div>
-    <div class="card">
-        <h2>Headers OIDC reçus</h2>
-        <table>
-            {rows}
-        </table>
-    </div>
-</body>
-</html>"""
-
-
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        # Extraire les headers OIDC injectés par mod_auth_openidc
-        username = self.headers.get("OIDC_CLAIM_preferred_username", "inconnu")
-        email = self.headers.get("OIDC_CLAIM_email", "")
-
-        # Construire le tableau de tous les headers OIDC
-        oidc_headers = {
-            k: v for k, v in self.headers.items()
-            if k.upper().startswith("OIDC_CLAIM") or k.upper() == "REMOTE_USER"
-        }
-
-        rows = ""
-        for k, v in sorted(oidc_headers.items()):
-            rows += f"<tr><td>{k}</td><td>{v}</td></tr>\n"
-
-        if not rows:
-            rows = "<tr><td colspan='2'>Aucun header OIDC reçu (accès direct ?)</td></tr>"
-
-        # Si c'est /userinfo, renvoyer du JSON
-        if self.path == "/userinfo":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(oidc_headers, indent=2).encode())
-            return
-
-        # Sinon, page HTML
-        html = HTML_TEMPLATE.format(username=username, rows=rows)
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(html.encode())
-
-
-if __name__ == "__main__":
-    server = HTTPServer(("0.0.0.0", 3001), Handler)
-    print("App 1 listening on :3001")
-    server.serve_forever()
-```
-
----
-
-## `apps/app2/Dockerfile`
-
-```dockerfile
-FROM python:3.12-slim
-WORKDIR /app
-COPY server.py .
-EXPOSE 3002
-CMD ["python", "server.py"]
-```
-
----
-
-## `apps/app2/server.py`
-
-```python
-"""
-App 2 - Zone Admin (accessible uniquement aux utilisateurs avec le rôle "admin").
-L'autorisation est gérée par Apache via : Require claim realm_access.roles:admin
-"""
-
-from http.server import HTTPServer, BaseHTTPRequestHandler
-
-HTML_TEMPLATE = """<!DOCTYPE html>
-<html lang="fr">
-<head>
-    <meta charset="utf-8">
-    <title>App 2 - Admin</title>
-    <style>
-        body {{ font-family: system-ui, sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; background: #fef2f2; }}
-        .card {{ background: white; border-radius: 8px; padding: 24px; margin: 16px 0; box-shadow: 0 1px 3px rgba(0,0,0,0.12); border-left: 4px solid #dc2626; }}
-        h1 {{ color: #dc2626; }}
-        .admin-badge {{ background: #fecaca; color: #991b1b; padding: 4px 12px; border-radius: 16px; font-weight: 600; }}
-        a.logout {{ color: #dc2626; text-decoration: none; font-weight: 600; }}
-    </style>
-</head>
-<body>
-    <div class="card">
-        <h1>App 2 - Panneau Admin</h1>
-        <p>Bienvenue <span class="admin-badge">{username}</span> (rôle admin vérifié par Apache)</p>
-        <p>Email : {email}</p>
-        <p><a class="logout" href="/logout">Se déconnecter</a></p>
-    </div>
-    <div class="card">
-        <h2>Cette page est protégée</h2>
-        <p>Seuls les utilisateurs ayant le rôle <code>admin</code> dans Keycloak
-        peuvent accéder à <code>/app2/</code>.</p>
-        <p>Apache vérifie automatiquement le claim <code>realm_access.roles</code>
-        dans le token OIDC.</p>
-    </div>
-</body>
-</html>"""
-
-
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        username = self.headers.get("OIDC_CLAIM_preferred_username", "inconnu")
-        email = self.headers.get("OIDC_CLAIM_email", "N/A")
-
-        html = HTML_TEMPLATE.format(username=username, email=email)
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(html.encode())
-
-
-if __name__ == "__main__":
-    server = HTTPServer(("0.0.0.0", 3002), Handler)
-    print("App 2 listening on :3002")
-    server.serve_forever()
-```
-
----
-
-## `.gitignore`
-
-```gitignore
-# Secrets
-apache/openidc.conf.local
-
-# Docker
-.env
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Logs
-*.log
-```
-
----
-
-## Tuto rapide
-
-### 1. Lancer
-
-```bash
-docker compose up -d --build
-```
-
-### 2. Configurer Keycloak (`http://localhost:8080`, login `admin`/`admin`)
-
-1. Créer realm **demo**
-2. Créer client **apache-proxy** (Client authentication: ON)
-   - Valid redirect URIs : `http://localhost/*`
-   - Backchannel logout URL : `http://apache/backchannel-logout`
-3. Copier le Client Secret → le coller dans `apache/openidc.conf` → `docker compose restart apache`
-4. Créer user **testuser** (password: `test1234`)
-5. Créer user **adminuser** (password: `admin1234`) + lui assigner le realm role **admin**
-
-### 3. Tester
-
-- `http://localhost/app1/` → login → dashboard (tous les users)
-- `http://localhost/app2/` → admin uniquement
-- `http://localhost/userinfo` → JSON des headers OIDC
-- Keycloak → Users → Sessions → **Sign out** → recharger la page → redirect login
+#!/usr/bin/env bash
+#
+# Simple Zenity application built as a small state machine.
+#
+#   STATE 1 (login)  : ask for a username and a password.
+#                      If the credentials are wrong, go back to STATE 1.
+#   STATE 2 (menu)   : let the user choose Import / Export / Quit.
+#                      While an Import or Export runs, the other buttons
+#                      are not reachable. The operation may last at most
+#                      5 minutes; after that the window closes on its own,
+#                      which we treat exactly like pressing "Quit".
+#
+# The script is written to be easy to follow even without programming
+# experience: every step is a small, clearly named function, and the
+# "main" function at the bottom simply walks through the two states.
+
+set -u   # using a variable that was never set is treated as an error
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+# Longest time (in seconds) an Import or Export is allowed to take.
+# 5 minutes = 300 seconds. When this limit is reached the window closes
+# by itself, and we treat that the same as the user choosing "Quit".
+readonly TIMEOUT_SECONDS=300
+
+# Character used by the login form to join its fields on a single line,
+# so we get back "username|password" and can split it ourselves.
+readonly FIELD_SEPARATOR="|"
+
+
+# ---------------------------------------------------------------------------
+# STATE 1 — Login
+# ---------------------------------------------------------------------------
+
+# Shows the login form.
+# On success it prints "username|password"; it returns a non-zero status
+# if the user closes or cancels the form.
+ask_for_credentials() {
+    zenity --forms \
+        --title="Login" \
+        --text="Please sign in to continue" \
+        --separator="$FIELD_SEPARATOR" \
+        --add-entry="Username" \
+        --add-password="Password"
+}
+
+# TODO: NOT IMPLEMENTED ON PURPOSE.
+# This function must decide whether the given username/password are valid.
+# It should return 0 when the user is authenticated, and a non-zero value
+# otherwise.
+#
+# For now it is a placeholder that accepts everyone, so the rest of the
+# application can be tried out. Replace the body with real verification
+# (for example: compare against a file, call an API, query PAM, ...).
+is_user_authenticated() {
+    local username="$1"
+    local password="$2"
+
+    # TODO: put the real authentication check here.
+
+    return 0   # placeholder: currently always "authenticated"
+}
+
+# Keeps showing the login form until the user is authenticated.
+# Returns 0 once login succeeds, or 1 if the user cancels the form.
+run_login_state() {
+    while true; do
+        local credentials
+        credentials="$(ask_for_credentials)" || return 1   # user cancelled
+
+        # Split "username|password" into its two parts.
+        local username="${credentials%%"${FIELD_SEPARATOR}"*}"
+        local password="${credentials#*"${FIELD_SEPARATOR}"}"
+
+        if is_user_authenticated "$username" "$password"; then
+            return 0   # success -> move on to the menu (STATE 2)
+        fi
+
+        # Wrong username or password: tell the user, then loop back to STATE 1.
+        zenity --error \
+            --title="Login failed" \
+            --text="Incorrect username or password. Please try again."
+    done
+}
+
+
+# ---------------------------------------------------------------------------
+# STATE 2 — Main menu (Import / Export / Quit)
+# ---------------------------------------------------------------------------
+
+# TODO: NOT IMPLEMENTED ON PURPOSE — the real Import logic goes here.
+#
+# While developing, this stub only pretends to work and drives the
+# progress bar: each plain number it prints is a percentage (0-100),
+# and each "# text" line updates the message shown in the window.
+run_import() {
+    for percent in $(seq 0 10 100); do
+        echo "$percent"
+        echo "# Importing... ${percent}%"
+        sleep 1
+    done
+}
+
+# TODO: NOT IMPLEMENTED ON PURPOSE — the real Export logic goes here.
+run_export() {
+    for percent in $(seq 0 10 100); do
+        echo "$percent"
+        echo "# Exporting... ${percent}%"
+        sleep 1
+    done
+}
+
+# Runs one operation (Import or Export) inside a progress window.
+#
+# Why this matches the requirements:
+#   * Only this window is on screen, so the menu's other buttons are NOT
+#     reachable while the operation runs.
+#   * --timeout closes the window after TIMEOUT_SECONDS (the 5-minute
+#     limit). When that happens, Zenity exits with status code 5.
+#
+# Arguments:
+#   $1 : human-readable name shown in the window ("Import" / "Export")
+#   $2 : name of the function that does the actual work
+#
+# Returns 0 when the operation finished normally, and 1 when the
+# 5-minute limit was reached (the caller should then quit the app).
+perform_operation() {
+    local operation_name="$1"
+    local worker_function="$2"
+
+    # The worker feeds the progress bar through the pipe.
+    "$worker_function" | \
+        zenity --progress \
+            --title="$operation_name" \
+            --text="Starting ${operation_name}..." \
+            --no-cancel \
+            --auto-close \
+            --timeout="$TIMEOUT_SECONDS"
+
+    # In a pipeline, PIPESTATUS[1] holds Zenity's own exit code.
+    # Code 5 means the dialog closed because of the 5-minute --timeout.
+    if [ "${PIPESTATUS[1]}" -eq 5 ]; then
+        return 1   # time limit reached -> behave like "Quit"
+    fi
+
+    return 0   # operation finished -> go back to the menu
+}
+
+# TODO: NOT IMPLEMENTED ON PURPOSE.
+# This function performs the operations that MUST happen before the
+# application closes — for example: saving the current state, flushing
+# buffers, deleting temporary files, closing connections, logging out, ...
+#
+# It is the single "Quit" routine and is reached in two situations, both
+# of which must run this cleanup:
+#   * the user chose "Quit" (or closed the menu window);
+#   * the 5-minute limit closed an operation (treated as "Quit").
+#
+# If the operations are slow, you can give feedback the same way Import and
+# Export do (a zenity --progress window).
+quit_application() {
+    # TODO: put the real pre-quit operations here.
+    :   # ":" is a placeholder that does nothing; remove it once implemented.
+}
+
+# Shows the menu and reacts to the chosen action.
+# Loops until the user chooses Quit (or a timeout ends the session).
+# Leaving this function ALWAYS leads to quit_application (see main).
+run_menu_state() {
+    while true; do
+        local choice
+        choice="$(zenity --list \
+            --title="Main menu" \
+            --text="What would you like to do?" \
+            --column="Action" \
+            "Import" \
+            "Export" \
+            "Quit")"
+
+        case "$choice" in
+            "Import")
+                # If the operation hit the 5-minute limit, leave the menu.
+                perform_operation "Import" "run_import" || return
+                ;;
+            "Export")
+                perform_operation "Export" "run_export" || return
+                ;;
+            "Quit" | "")
+                # "Quit" button, Cancel, or the window was closed.
+                return
+                ;;
+        esac
+    done
+}
+
+
+# ---------------------------------------------------------------------------
+# Main program — the state machine
+# ---------------------------------------------------------------------------
+
+main() {
+    # STATE 1: keep asking until the user logs in (or cancels the form).
+    if ! run_login_state; then
+        exit 0   # user gave up on the login screen -> nothing more to do
+    fi
+
+    # STATE 2: the main menu.
+    run_menu_state
+
+    # Leaving the menu (Quit button OR 5-minute timeout) brings us here.
+    # Run the required pre-quit operations, then end the program.
+    quit_application
+    exit 0
+}
+
+main "$@"
