@@ -1,531 +1,583 @@
 #!/usr/bin/env bash
-###############################################################################
-#
-#   raid-check-repair.sh
-#   ---------------------------------------------------------------------------
-#   Vérification et réparation d'un RAID1 logiciel (mdadm) sur sda et sdb.
-#   Tables de partition : GPT. À exécuter en root.
-#
-#   Arbre de décision :
-#     - Un des deux disques absent ........................ exit, rien à faire
-#     - Tailles des disques différentes ................... exit, rien à faire
-#     - Resync/recovery en cours .......................... exit, on laisse finir
-#     - GPT invalide sur un seul disque ................... on restaure depuis l'autre
-#     - GPT invalide sur les deux disques ................. exit, intervention manuelle
-#     - Array dégradé / superblock manquant / faulty ...... on répare
-#     - mismatch_cnt > 0 .................................. on lance un repair
-#     - Tout va bien ...................................... exit, rien à faire
-#
-#   Options :
-#     --dry-run    Affiche les actions sans les exécuter
-#     --help       Aide
-#
-###############################################################################
-
 set -euo pipefail
 
+# Crée l'arborescence complète du projet rtp-bridge dans le dossier courant.
+# Usage: ./gen_rtp_bridge.sh
 
-# =============================================================================
-# 1. CONFIGURATION
-# =============================================================================
+PROJECT_DIR="rtp-bridge"
 
-readonly DISK_A="/dev/sda"
-readonly DISK_B="/dev/sdb"
-readonly LOCK_FILE="/var/run/raid-check-repair.lock"
-readonly GPT_BACKUP="/tmp/raid-gpt-source.bin"
+if [ -d "$PROJECT_DIR" ]; then
+  echo "Erreur: le dossier '$PROJECT_DIR' existe déjà. Supprime-le ou lance ce script ailleurs." >&2
+  exit 1
+fi
 
-# Codes de sortie explicites pour le supervisor.
-readonly EXIT_OK=0
-readonly EXIT_USAGE=1
-readonly EXIT_DISK_MISSING=2
-readonly EXIT_SIZE_MISMATCH=3
-readonly EXIT_BOTH_GPT_INVALID=4
-readonly EXIT_LOCK_HELD=5
-readonly EXIT_NOT_ROOT=6
-readonly EXIT_MISSING_TOOL=7
+mkdir -p "$PROJECT_DIR/src" "$PROJECT_DIR/static"
+cd "$PROJECT_DIR"
 
-DRY_RUN=0
+cat > Cargo.toml << 'CARGO_EOF'
+[package]
+name = "rtp-bridge"
+version = "0.1.0"
+edition = "2021"
 
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+webrtc = "0.11"
+sdp = "0.6"
+axum = { version = "0.7", features = ["ws"] }
+tokio-tungstenite = "0.23"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+futures-util = "0.3"
+CARGO_EOF
 
-# =============================================================================
-# 2. HELPERS GÉNÉRIQUES (logs, exécution, prérequis)
-# =============================================================================
+cat > src/main.rs << 'MAIN_EOF'
+mod sdp_parser;
+mod signaling;
 
-log()  { echo "[INFO]  $*"; }
-warn() { echo "[WARN]  $*"; }
-err()  { echo "[ERROR] $*" >&2; }
+use anyhow::{Context, Result};
+use axum::{
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        State,
+    },
+    response::IntoResponse,
+    routing::get,
+    Router,
+};
+use futures_util::{SinkExt, StreamExt};
+use signaling::SignalMsg;
+use std::sync::Arc;
+use tokio::net::UdpSocket;
+use tracing::{error, info, warn};
+use webrtc::{
+    api::{
+        interceptor_registry::register_default_interceptors, media_engine::MediaEngine,
+        APIBuilder,
+    },
+    ice_transport::{ice_candidate::RTCIceCandidateInit, ice_server::RTCIceServer},
+    interceptor::registry::Registry,
+    peer_connection::{configuration::RTCConfiguration, sdp::session_description::RTCSessionDescription},
+    rtp_transceiver::{
+        rtp_codec::{RTCRtpCodecCapability, RTCRtpCodecParameters, RTPCodecType},
+        rtp_transceiver_direction::RTCRtpTransceiverDirection,
+        RTCRtpTransceiverInit,
+    },
+    track::track_local::{track_local_static_rtp::TrackLocalStaticRTP, TrackLocal},
+};
 
-section() {
-    echo ""
-    echo "==> $*"
+// ---- Config en dur pour rester lisible. À sortir en argv/env si besoin. ----
+const SDP_FILE_PATH: &str = "source.sdp";
+const HTTP_BIND_ADDR: &str = "0.0.0.0:8080";
+
+#[derive(Clone)]
+struct AppState {
+    track_info: Arc<sdp_parser::VideoTrackInfo>,
 }
 
-# Exécute la commande passée, ou l'affiche seulement en mode --dry-run.
-run() {
-    if (( DRY_RUN )); then
-        echo "[DRY-RUN] $*"
-        return 0
-    fi
-    "$@"
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
+
+    // 1. Parse le SDP source une fois au démarrage pour connaître le codec réel.
+    let sdp_content = std::fs::read_to_string(SDP_FILE_PATH)
+        .with_context(|| format!("impossible de lire {SDP_FILE_PATH}"))?;
+    let track_info = sdp_parser::parse_sdp_file(&sdp_content)?;
+    info!(
+        "SDP source parsé: PT={} codec={} clock={} port={} fmtp={:?}",
+        track_info.payload_type,
+        track_info.mime_type,
+        track_info.clock_rate,
+        track_info.rtp_port,
+        track_info.fmtp
+    );
+
+    let state = AppState {
+        track_info: Arc::new(track_info),
+    };
+
+    // 2. Serveur HTTP/WS : sert index.html + endpoint de signaling.
+    let app = Router::new()
+        .route("/", get(serve_index))
+        .route("/ws", get(ws_handler))
+        .with_state(state);
+
+    info!("Serveur démarré sur http://{HTTP_BIND_ADDR}");
+    let listener = tokio::net::TcpListener::bind(HTTP_BIND_ADDR).await?;
+    axum::serve(listener, app).await?;
+
+    Ok(())
 }
 
-usage() {
-    cat <<EOF
-Usage: $0 [--dry-run] [--help]
-
-Vérifie et répare un RAID1 logiciel monté sur ${DISK_A} et ${DISK_B}.
-
-Options :
-  --dry-run    Affiche les actions sans rien modifier sur les disques
-  --help, -h   Affiche cette aide
-EOF
+async fn serve_index() -> impl IntoResponse {
+    axum::response::Html(include_str!("../static/index.html"))
 }
 
-ensure_root() {
-    if (( EUID != 0 )); then
-        err "Ce script doit être exécuté en root."
-        exit $EXIT_NOT_ROOT
-    fi
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_signaling(socket, state))
 }
 
-ensure_tools_available() {
-    local missing=()
-    local tool
-    for tool in mdadm sgdisk lsblk blkid awk grep partprobe blockdev flock; do
-        command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
-    done
-
-    if (( ${#missing[@]} > 0 )); then
-        err "Outils manquants : ${missing[*]}"
-        exit $EXIT_MISSING_TOOL
-    fi
+/// Une session = un viewer = une PeerConnection dédiée, alimentée par le même flux RTP.
+/// Pour du multi-viewer il faudrait un fan-out du flux RTP décodé une fois vers N tracks ;
+/// ici on garde volontairement simple : un viewer à la fois se branche sur le socket UDP.
+async fn handle_signaling(socket: WebSocket, state: AppState) {
+    if let Err(e) = run_session(socket, state).await {
+        error!("session terminée en erreur: {e:#}");
+    }
 }
 
-# Empêche deux instances de tourner en parallèle (boot + cron par exemple).
-acquire_lock() {
-    exec 9>"$LOCK_FILE"
-    if ! flock -n 9; then
-        err "Une autre instance est déjà en cours ($LOCK_FILE)."
-        exit $EXIT_LOCK_HELD
-    fi
-}
+async fn run_session(socket: WebSocket, state: AppState) -> Result<()> {
+    let (mut ws_tx, mut ws_rx) = socket.split();
 
+    // ---- Setup MediaEngine avec le codec exact déduit du SDP source ----
+    let mut media_engine = MediaEngine::default();
+    let capability = RTCRtpCodecCapability {
+        mime_type: state.track_info.mime_type.clone(),
+        clock_rate: state.track_info.clock_rate,
+        channels: 0,
+        sdp_fmtp_line: state.track_info.fmtp.clone().unwrap_or_default(),
+        rtcp_feedback: vec![],
+    };
+    media_engine.register_codec(
+        RTCRtpCodecParameters {
+            capability: capability.clone(),
+            payload_type: state.track_info.payload_type,
+            ..Default::default()
+        },
+        RTPCodecType::Video,
+    )?;
 
-# =============================================================================
-# 3. VÉRIFICATIONS PRÉALABLES
-# =============================================================================
+    let mut registry = Registry::new();
+    registry = register_default_interceptors(registry, &mut media_engine)?;
 
-# Vérifie que les deux disques sont visibles par le kernel.
-check_both_disks_present() {
-    section "Présence des disques"
+    let api = APIBuilder::new()
+        .with_media_engine(media_engine)
+        .with_interceptor_registry(registry)
+        .build();
 
-    local missing=0
-    local disk
-    for disk in "$DISK_A" "$DISK_B"; do
-        if [[ -b "$disk" ]]; then
-            log "  $disk présent"
-        else
-            err "  $disk absent"
-            missing=1
-        fi
-    done
+    let config = RTCConfiguration {
+        ice_servers: vec![RTCIceServer {
+            urls: vec!["stun:stun.l.google.com:19302".to_owned()],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
 
-    if (( missing )); then
-        err "Un disque manque, aucune action ne sera tentée."
-        exit $EXIT_DISK_MISSING
-    fi
-}
+    let pc = Arc::new(api.new_peer_connection(config).await?);
 
-# Refuse d'agir si les deux disques n'ont pas exactement la même taille,
-# car un disque plus petit corromprait l'array, et un disque plus gros
-# indique probablement une erreur de remplacement.
-check_disks_same_size() {
-    section "Taille des disques"
+    // Track locale alimentée par le flux RTP source
+    let video_track = Arc::new(TrackLocalStaticRTP::new(
+        capability,
+        "video".to_owned(),
+        "rtp-bridge".to_owned(),
+    ));
 
-    local size_a size_b
-    size_a=$(blockdev --getsize64 "$DISK_A")
-    size_b=$(blockdev --getsize64 "$DISK_B")
+    pc.add_transceiver_from_track(
+        Arc::clone(&video_track) as Arc<dyn TrackLocal + Send + Sync>,
+        Some(RTCRtpTransceiverInit {
+            direction: RTCRtpTransceiverDirection::Sendonly,
+            send_encodings: vec![],
+        }),
+    )
+    .await?;
 
-    log "  $DISK_A : $size_a octets"
-    log "  $DISK_B : $size_b octets"
+    // Toute écriture sur le WebSocket passe par ce channel unique, pour éviter
+    // de devoir cloner/partager le sink ws_tx entre plusieurs tâches.
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<SignalMsg>();
 
-    if [[ "$size_a" != "$size_b" ]]; then
-        err "Les deux disques n'ont pas la même taille."
-        err "Refus d'agir pour ne pas corrompre l'array."
-        exit $EXIT_SIZE_MISMATCH
-    fi
-}
+    let ice_out_tx = out_tx.clone();
+    pc.on_ice_candidate(Box::new(move |candidate| {
+        let ice_out_tx = ice_out_tx.clone();
+        Box::pin(async move {
+            if let Some(candidate) = candidate {
+                if let Ok(init) = candidate.to_json() {
+                    let _ = ice_out_tx.send(SignalMsg::Ice { candidate: init });
+                }
+            }
+        })
+    }));
 
-# Si une synchro est en cours, on ne touche à rien : la couper laisserait
-# l'array dans un état pire qu'avant.
-check_no_sync_in_progress() {
-    section "Resync / recovery en cours ?"
+    // ---- Crée l'offer et l'envoie au navigateur ----
+    let offer = pc.create_offer(None).await?;
+    pc.set_local_description(offer.clone()).await?;
+    out_tx.send(SignalMsg::Offer { sdp: offer.sdp })?;
 
-    if grep -qE 'resync|recovery|reshape|check' /proc/mdstat; then
-        warn "Opération mdadm détectée, on laisse finir :"
-        grep -E 'resync|recovery|reshape|check' /proc/mdstat || true
-        exit $EXIT_OK
-    fi
-
-    log "  Aucune synchro en cours."
-}
-
-
-# =============================================================================
-# 4. GESTION DE LA TABLE DE PARTITION (GPT)
-# =============================================================================
-
-# Vrai (0) si le disque a une GPT lisible, faux sinon.
-disk_has_valid_gpt() {
-    sgdisk --print "$1" >/dev/null 2>&1
-}
-
-# Restaure uniquement les partitions manquantes depuis src vers dst,
-# en récupérant leur spec (start/size/type) depuis le dump sfdisk de src.
-# Les UUIDs sont supprimés pour qu'ils soient régénérés automatiquement.
-restore_missing_partitions_from() {
-    local src="$1"
-    local dst="$2"
-    local missing_nums="$3"
-
-    local num
-    for num in $missing_nums; do
-        warn "  Restauration partition $num : $src --> $dst"
-
-        local spec
-        spec=$(sfdisk --dump "$src" \
-            | grep "^${src}${num} " \
-            | sed "s|${src}${num}|${dst}${num}|; s/, *uuid=[A-Fa-f0-9-]*//g")
-
-        if [[ -z "$spec" ]]; then
-            err "  Spec introuvable pour la partition $num sur $src."
-            continue
-        fi
-
-        if (( DRY_RUN )); then
-            echo "[DRY-RUN] sfdisk --append $dst <<< '$spec'"
-        else
-            echo "$spec" | sfdisk --append "$dst"
-        fi
-    done
-
-    run partprobe "$dst"
-}
-
-# Évalue l'état GPT des deux disques.
-# Si un disque n'a plus de GPT du tout, on restaure toutes ses partitions
-# depuis le disque sain. Sort en erreur si les deux GPT sont KO.
-check_and_repair_partition_tables() {
-    section "État des tables GPT"
-
-    local a_ok=0 b_ok=0
-    disk_has_valid_gpt "$DISK_A" && a_ok=1
-    disk_has_valid_gpt "$DISK_B" && b_ok=1
-
-    log "  $DISK_A : $( (( a_ok )) && echo OK || echo INVALIDE)"
-    log "  $DISK_B : $( (( b_ok )) && echo OK || echo INVALIDE)"
-
-    if (( ! a_ok && ! b_ok )); then
-        err "Aucune table GPT valide sur les deux disques."
-        err "Intervention manuelle requise."
-        exit $EXIT_BOTH_GPT_INVALID
-    fi
-
-    # GPT entièrement absente sur un disque : on recopie toutes les partitions.
-    if (( ! a_ok )); then
-        local all_parts
-        all_parts=$(lsblk -ln -o NAME "$DISK_B" \
-            | grep -E '^sdb[0-9]+$' | sed 's/sdb//')
-        restore_missing_partitions_from "$DISK_B" "$DISK_A" "$all_parts"
-    elif (( ! b_ok )); then
-        local all_parts
-        all_parts=$(lsblk -ln -o NAME "$DISK_A" \
-            | grep -E '^sda[0-9]+$' | sed 's/sda//')
-        restore_missing_partitions_from "$DISK_A" "$DISK_B" "$all_parts"
-    fi
-}
-
-# Vérifie que sda et sdb ont exactement les mêmes numéros de partitions.
-# Si une partition manque sur un seul disque (ou des partitions différentes
-# manquent sur chacun), on restaure uniquement les entrées manquantes.
-check_and_repair_partition_layout() {
-    section "Cohérence du schéma de partitions"
-
-    local parts_a parts_b
-    parts_a=$(lsblk -ln -o NAME "$DISK_A" \
-        | grep -E '^sda[0-9]+$' | sed 's/sda//' | sort -n)
-    parts_b=$(lsblk -ln -o NAME "$DISK_B" \
-        | grep -E '^sdb[0-9]+$' | sed 's/sdb//' | sort -n)
-
-    if [[ "$parts_a" == "$parts_b" ]]; then
-        log "  Schémas identiques."
-        return 0
-    fi
-
-    # L'union des deux disques constitue la référence complète.
-    local reference
-    reference=$(printf '%s\n%s\n' "$parts_a" "$parts_b" | sort -n | uniq)
-
-    local missing_on_a missing_on_b
-    missing_on_a=$(comm -23 \
-        <(echo "$reference") \
-        <(echo "$parts_a" | tr ' ' '\n') || true)
-    missing_on_b=$(comm -23 \
-        <(echo "$reference") \
-        <(echo "$parts_b" | tr ' ' '\n') || true)
-
-    if [[ -n "$missing_on_a" ]]; then
-        warn "  $DISK_A manque les partitions : $(echo $missing_on_a | tr '\n' ' ')"
-        restore_missing_partitions_from "$DISK_B" "$DISK_A" "$missing_on_a"
-    fi
-
-    if [[ -n "$missing_on_b" ]]; then
-        warn "  $DISK_B manque les partitions : $(echo $missing_on_b | tr '\n' ' ')"
-        restore_missing_partitions_from "$DISK_A" "$DISK_B" "$missing_on_b"
-    fi
-}
-
-
-# =============================================================================
-# 5. INTROSPECTION DES ARRAYS RAID
-# =============================================================================
-
-# Liste les arrays md actifs (ex: "md0 md1 md2").
-list_active_md_arrays() {
-    awk '/^md[0-9]+ :/ {print $1}' /proc/mdstat
-}
-
-# Pour un array donné, liste les noms de partitions membres (sans flags).
-list_array_member_partitions() {
-    local md="$1"
-    awk -v md="$md" '
-        $1 == md ":" {
-            for (i = 5; i <= NF; i++) {
-                gsub(/\[[0-9]+\]/, "", $i)   # retire [0], [1]...
-                gsub(/\(F\)/,     "", $i)    # retire le flag faulty
-                gsub(/\(S\)/,     "", $i)    # retire le flag spare
-                print $i
+    // ---- Tâche d'écriture: unique propriétaire de ws_tx ----
+    let send_task = tokio::spawn(async move {
+        while let Some(msg) = out_rx.recv().await {
+            if let Ok(text) = serde_json::to_string(&msg) {
+                if ws_tx.send(Message::Text(text)).await.is_err() {
+                    break;
+                }
             }
         }
-    ' /proc/mdstat
+    });
+
+    // ---- Tâche de lecture: reçoit answer + ICE candidates du navigateur ----
+    let pc_for_rx = Arc::clone(&pc);
+    let recv_task = tokio::spawn(async move {
+        while let Some(Ok(msg)) = ws_rx.next().await {
+            let Message::Text(text) = msg else { continue };
+            match serde_json::from_str::<SignalMsg>(&text) {
+                Ok(SignalMsg::Answer { sdp }) => {
+                    let answer = match RTCSessionDescription::answer(sdp) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            error!("answer SDP invalide reçu du navigateur: {e}");
+                            continue;
+                        }
+                    };
+                    if let Err(e) = pc_for_rx.set_remote_description(answer).await {
+                        error!("set_remote_description a échoué: {e}");
+                    }
+                }
+                Ok(SignalMsg::Ice { candidate }) => {
+                    if let Err(e) = pc_for_rx.add_ice_candidate(candidate).await {
+                        warn!("add_ice_candidate a échoué: {e}");
+                    }
+                }
+                Ok(SignalMsg::Offer { .. }) => {
+                    warn!("offer inattendue reçue côté serveur, ignorée");
+                }
+                Err(e) => warn!("message de signaling illisible: {e}"),
+            }
+        }
+    });
+
+    // ---- Boucle de forward RTP: lit le socket UDP source et écrit dans la track ----
+    let rtp_task = {
+        let track_info = Arc::clone(&state.track_info);
+        tokio::spawn(async move {
+            if let Err(e) = forward_rtp(track_info, video_track).await {
+                error!("boucle RTP terminée en erreur: {e:#}");
+            }
+        })
+    };
+
+    tokio::select! {
+        _ = recv_task => {},
+        _ = send_task => {},
+        _ = rtp_task => {},
+    }
+
+    Ok(())
 }
 
-# Vrai si l'array n'est pas dans un état clean/active.
-array_is_degraded() {
-    local md="$1"
-    local state
-    state=$(cat "/sys/block/$md/md/array_state" 2>/dev/null || echo unknown)
+/// Lit en continu les paquets RTP depuis le socket UDP source, filtre par
+/// payload type attendu (au cas où plusieurs flux arrivent sur le même port),
+/// et les réinjecte dans la track WebRTC locale.
+async fn forward_rtp(
+    track_info: Arc<sdp_parser::VideoTrackInfo>,
+    track: Arc<TrackLocalStaticRTP>,
+) -> Result<()> {
+    let socket = UdpSocket::bind(("0.0.0.0", track_info.rtp_port))
+        .await
+        .with_context(|| format!("bind UDP échoué sur le port {}", track_info.rtp_port))?;
+    info!("écoute RTP sur 0.0.0.0:{}", track_info.rtp_port);
 
-    case "$state" in
-        clean|active) return 1 ;;
-        *)            return 0 ;;
-    esac
+    let mut buf = [0u8; 1500];
+    loop {
+        let (len, _addr) = socket.recv_from(&mut buf).await?;
+        let mut pkt_buf = &buf[..len];
+
+        let packet = match webrtc::rtp::packet::Packet::unmarshal(&mut pkt_buf) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("paquet RTP illisible, ignoré: {e}");
+                continue;
+            }
+        };
+
+        if packet.header.payload_type != track_info.payload_type {
+            // probablement un autre flux (ex: audio mêlé sur le même port) -> on ignore
+            continue;
+        }
+
+        if let Err(e) = track.write_rtp(&packet).await {
+            warn!("écriture RTP vers la track a échoué: {e}");
+        }
+    }
+}
+MAIN_EOF
+
+cat > src/sdp_parser.rs << 'SDPP_EOF'
+use anyhow::{anyhow, Context, Result};
+use sdp::description::session::SessionDescription;
+use std::io::Cursor;
+
+/// Ce qu'on extrait du .sdp source pour configurer la track WebRTC
+/// et filtrer les paquets RTP entrants.
+#[derive(Debug, Clone)]
+pub struct VideoTrackInfo {
+    pub payload_type: u8,
+    pub mime_type: String, // ex: "video/H264"
+    pub clock_rate: u32,
+    pub fmtp: Option<String>, // ex: "profile-level-id=42e01f;packetization-mode=1"
+    pub rtp_port: u16,
 }
 
-# Liste les devices marqués "faulty" dans l'array (sortie : "/dev/sda1", etc.).
-list_faulty_devices_in_array() {
-    local md="$1"
-    mdadm --detail "/dev/$md" 2>/dev/null | awk '/faulty/ {print $NF}'
+pub fn parse_sdp_file(sdp_content: &str) -> Result<VideoTrackInfo> {
+    let mut reader = Cursor::new(sdp_content.as_bytes());
+    let sdp = SessionDescription::unmarshal(&mut reader).context("SDP invalide ou illisible")?;
+
+    let media = sdp
+        .media_descriptions
+        .iter()
+        .find(|m| m.media_name.media == "video")
+        .ok_or_else(|| anyhow!("aucune section 'm=video' trouvée dans le SDP"))?;
+
+    let rtp_port = media.media_name.port.value as u16;
+
+    let pt_str = media
+        .media_name
+        .formats
+        .first()
+        .ok_or_else(|| anyhow!("aucun payload type déclaré pour la section video"))?;
+    let payload_type: u8 = pt_str.parse().context("payload type non numérique")?;
+
+    // Cherche l'attribut a=rtpmap:<pt> <codec>/<clockrate>
+    let rtpmap_value = media
+        .attributes
+        .iter()
+        .find(|a| a.key == "rtpmap")
+        .and_then(|a| a.value.clone())
+        .ok_or_else(|| anyhow!("aucun a=rtpmap trouvé pour PT {payload_type}"))?;
+
+    let mut parts = rtpmap_value.split_whitespace();
+    let found_pt: u8 = parts
+        .next()
+        .ok_or_else(|| anyhow!("rtpmap malformé"))?
+        .parse()
+        .context("PT du rtpmap non numérique")?;
+    if found_pt != payload_type {
+        return Err(anyhow!(
+            "incohérence: PT déclaré dans m=video ({payload_type}) != PT du rtpmap ({found_pt})"
+        ));
+    }
+
+    let codec_clock = parts
+        .next()
+        .ok_or_else(|| anyhow!("rtpmap sans partie codec/clockrate"))?;
+    let mut codec_parts = codec_clock.split('/');
+    let codec_name = codec_parts
+        .next()
+        .ok_or_else(|| anyhow!("rtpmap sans nom de codec"))?
+        .to_uppercase();
+    let clock_rate: u32 = codec_parts
+        .next()
+        .unwrap_or("90000")
+        .parse()
+        .unwrap_or(90000);
+
+    // fmtp optionnel (important pour H264 : profile-level-id, packetization-mode)
+    let fmtp = media
+        .attributes
+        .iter()
+        .find(|a| a.key == "fmtp")
+        .and_then(|a| a.value.clone())
+        .and_then(|v| v.split_once(' ').map(|(_, params)| params.to_string()));
+
+    Ok(VideoTrackInfo {
+        payload_type,
+        mime_type: format!("video/{codec_name}"),
+        clock_rate,
+        fmtp,
+        rtp_port,
+    })
 }
+SDPP_EOF
 
-# Compteur de mismatchs entre les deux miroirs (devrait toujours être 0).
-get_array_mismatch_count() {
-    local md="$1"
-    cat "/sys/block/$md/md/mismatch_cnt" 2>/dev/null || echo 0
+cat > src/signaling.rs << 'SIG_EOF'
+use serde::{Deserialize, Serialize};
+use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
+
+/// Messages échangés sur le WebSocket de signaling, dans les deux sens.
+/// Le tag "type" permet au JS de faire un simple switch sur le champ.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum SignalMsg {
+    Offer { sdp: String },
+    Answer { sdp: String },
+    Ice { candidate: RTCIceCandidateInit },
 }
+SIG_EOF
 
-# Vrai si la partition possède un superblock mdadm valide.
-partition_has_md_superblock() {
-    mdadm --examine "/dev/$1" >/dev/null 2>&1
-}
+cat > static/index.html << 'HTML_EOF'
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>RTP → WebRTC Viewer</title>
+<style>
+  body { font-family: sans-serif; background: #111; color: #eee; text-align: center; }
+  video { width: 80%; max-width: 900px; margin-top: 20px; background: #000; }
+  #status { font-family: monospace; margin-top: 10px; color: #8f8; }
+  #status.error { color: #f88; }
+</style>
+</head>
+<body>
+  <h1>Flux RTP relayé en WebRTC</h1>
+  <video id="video" autoplay playsinline controls></video>
+  <div id="status">connexion...</div>
 
-# Détermine quelles partitions (sda<N> et sdb<N>) appartiennent à cet array.
-# Stratégie :
-#   1. on regarde un membre actuel pour en extraire le numéro N
-#   2. fallback : on cherche par UUID d'array via mdadm --examine
-expected_partitions_for_array() {
-    local md="$1"
-    local part_num=""
+<script>
+(() => {
+  const videoEl = document.getElementById('video');
+  const statusEl = document.getElementById('status');
 
-    # Étape 1 : déduire N depuis un membre actuel.
-    local m
-    for m in $(list_array_member_partitions "$md"); do
-        if [[ "$m" =~ ^sd[ab]([0-9]+)$ ]]; then
-            part_num="${BASH_REMATCH[1]}"
-            break
-        fi
-    done
+  const setStatus = (text, isError = false) => {
+    statusEl.textContent = text;
+    statusEl.className = isError ? 'error' : '';
+  };
 
-    # Étape 2 : si aucun membre n'est resté en place, on croise les UUIDs.
-    if [[ -z "$part_num" ]]; then
-        local array_uuid part_uuid p
-        array_uuid=$(mdadm --detail "/dev/$md" 2>/dev/null \
-            | awk -F: '/UUID/ {gsub(/ /,"",$2); print $2; exit}')
+  const wsProtocol = location.protocol === 'https:' ? 'wss' : 'ws';
+  const ws = new WebSocket(`${wsProtocol}://${location.host}/ws`);
 
-        for p in $(lsblk -ln -o NAME "$DISK_A" "$DISK_B" 2>/dev/null \
-                    | grep -E '^sd[ab][0-9]+$'); do
-            part_uuid=$(mdadm --examine "/dev/$p" 2>/dev/null \
-                | awk -F: '/Array UUID/ {gsub(/ /,"",$2); print $2; exit}')
+  const pc = new RTCPeerConnection({
+    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+  });
 
-            if [[ -n "$array_uuid" && "$array_uuid" == "$part_uuid" ]]; then
-                if [[ "$p" =~ ^sd[ab]([0-9]+)$ ]]; then
-                    part_num="${BASH_REMATCH[1]}"
-                    break
-                fi
-            fi
-        done
-    fi
+  // On ne fait que recevoir de la vidéo, on n'envoie rien depuis le navigateur.
+  pc.addTransceiver('video', { direction: 'recvonly' });
 
-    if [[ -n "$part_num" ]]; then
-        echo "sda${part_num} sdb${part_num}"
-    fi
-}
+  pc.ontrack = (event) => {
+    videoEl.srcObject = event.streams[0];
+    setStatus('flux reçu, lecture en cours');
+  };
 
+  pc.oniceconnectionstatechange = () => {
+    setStatus(`ICE: ${pc.iceConnectionState}`, pc.iceConnectionState === 'failed');
+  };
 
-# =============================================================================
-# 6. RÉPARATION DES ARRAYS
-# =============================================================================
+  pc.onicecandidate = (event) => {
+    if (event.candidate) {
+      ws.send(JSON.stringify({ type: 'ice', candidate: event.candidate.toJSON() }));
+    }
+  };
 
-# Sort les devices faulty de l'array (les laisser dedans empêche tout re-add).
-remove_faulty_devices_from() {
-    local md="$1"
-    local dev
-    for dev in $(list_faulty_devices_in_array "$md"); do
-        warn "  $dev marqué faulty, retrait de /dev/$md"
-        run mdadm --manage "/dev/$md" --remove "$dev" || true
-    done
-}
+  ws.onopen = () => setStatus('websocket connecté, attente de l\'offer serveur');
 
-# (Ré)ajoute une partition à un array, en wipant le superblock s'il est KO.
-readd_partition_to_array() {
-    local md="$1"
-    local part="$2"
+  ws.onerror = () => setStatus('erreur websocket', true);
 
-    if ! partition_has_md_superblock "$part"; then
-        warn "  Superblock mdadm absent/corrompu sur /dev/$part, on le réinitialise."
-        run mdadm --zero-superblock --force "/dev/$part" || true
-    fi
+  ws.onclose = () => setStatus('websocket fermé', true);
 
-    log "  Ajout de /dev/$part dans /dev/$md"
-    run mdadm --manage "/dev/$md" --add "/dev/$part"
-}
+  ws.onmessage = async (msg) => {
+    let data;
+    try {
+      data = JSON.parse(msg.data);
+    } catch (e) {
+      console.error('message de signaling illisible', e);
+      return;
+    }
 
-# Pipeline complet de réparation d'un array : faulty, manquants, mismatch.
-repair_single_array() {
-    local md="$1"
-    section "Réparation de /dev/$md"
+    switch (data.type) {
+      case 'offer': {
+        await pc.setRemoteDescription({ type: 'offer', sdp: data.sdp });
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        ws.send(JSON.stringify({ type: 'answer', sdp: answer.sdp }));
+        setStatus('answer envoyée, négociation ICE en cours');
+        break;
+      }
+      case 'ice': {
+        try {
+          await pc.addIceCandidate(data.candidate);
+        } catch (e) {
+          console.warn('ICE candidate rejetée', e);
+        }
+        break;
+      }
+      default:
+        console.warn('type de message inconnu:', data.type);
+    }
+  };
+})();
+</script>
+</body>
+</html>
+HTML_EOF
 
-    local state
-    state=$(cat "/sys/block/$md/md/array_state" 2>/dev/null || echo unknown)
-    log "  État actuel : $state"
+cat > source.sdp.example << 'SDPEX_EOF'
+v=0
+o=- 0 0 IN IP4 127.0.0.1
+s=RTP Stream
+c=IN IP4 127.0.0.1
+t=0 0
+m=video 5004 RTP/AVP 96
+a=rtpmap:96 H264/90000
+a=fmtp:96 profile-level-id=42e01f;packetization-mode=1
+SDPEX_EOF
 
-    # 1. Retirer les devices faulty.
-    remove_faulty_devices_from "$md"
+cat > README.md << 'README_EOF'
+# rtp-bridge
 
-    # 2. Identifier ce qui devrait être là vs ce qui y est.
-    local expected current
-    expected=$(expected_partitions_for_array "$md")
-    current=$(list_array_member_partitions "$md")
+Relaie un flux RTP (vidéo) vers une page web via WebRTC, sans passer par un SFU externe.
 
-    log "  Membres attendus : ${expected:-<inconnu>}"
-    log "  Membres présents : ${current:-<aucun>}"
+## Utilisation
 
-    if [[ -z "$expected" ]]; then
-        warn "  Impossible de déterminer les partitions attendues, on passe."
-        return 0
-    fi
+1. Place ton fichier SDP source à la racine sous le nom `source.sdp`
+   (voir `source.sdp.example` pour le format attendu).
+2. `cargo build --release`
+3. `cargo run --release`
+4. Ouvre `http://localhost:8080` dans un navigateur.
+5. Pointe ta source RTP vers `udp://<ip-du-serveur>:<port du m=video dans le SDP>`.
 
-    # 3. Pour chaque partition manquante, on tente le re-add.
-    local part
-    for part in $expected; do
-        if echo "$current" | grep -qw "$part"; then
-            continue
-        fi
-        if [[ -b "/dev/$part" ]]; then
-            readd_partition_to_array "$md" "$part"
-        else
-            err "  Partition /dev/$part attendue mais introuvable."
-        fi
-    done
+## Ce que fait le code
 
-    # 4. Mismatch entre miroirs ? On lance un repair.
-    local mismatch
-    mismatch=$(get_array_mismatch_count "$md")
-    if (( mismatch > 0 )); then
-        warn "  mismatch_cnt=$mismatch sur /dev/$md, lancement d'un repair."
-        run bash -c "echo repair > /sys/block/$md/md/sync_action"
-    fi
-}
+- `src/sdp_parser.rs` : lit le `.sdp`, en extrait le payload type, le codec
+  (mime_type), le clock rate, le `fmtp` et le port RTP attendu.
+- `src/main.rs` :
+  - configure un `MediaEngine` webrtc-rs avec **exactement** le codec déclaré
+    dans le SDP (pas de négociation multi-codec, pas de devinette),
+  - ouvre une session par connexion WebSocket entrante (`/ws`),
+  - crée une `PeerConnection` + une `TrackLocalStaticRTP` en mode `sendonly`,
+  - fait l'offer/answer + trickle ICE avec le navigateur via WebSocket,
+  - écoute le port UDP indiqué dans le SDP, filtre les paquets par payload
+    type, et les réinjecte tels quels dans la track (pas de transcodage).
+- `static/index.html` : page unique, `RTCPeerConnection` natif du navigateur,
+  pas de SDK externe. Affiche le flux dans une balise `<video>`.
 
-# Vrai si au moins un array a un problème détectable (dégradé ou mismatch).
-any_array_needs_repair() {
-    local md
-    for md in $(list_active_md_arrays); do
-        if array_is_degraded "$md"; then
-            return 0
-        fi
-        if (( $(get_array_mismatch_count "$md") > 0 )); then
-            return 0
-        fi
-    done
-    return 1
-}
+## Limites connues / points à durcir si besoin
 
+- **Un seul flux RTP consommé par session WebSocket.** Si deux navigateurs se
+  connectent en même temps, chacun ouvre son propre `bind()` UDP sur le même
+  port → ça va échouer au 2e `bind`. Pour du multi-viewer, il faut découpler
+  la lecture UDP (une seule tâche globale) du fan-out vers plusieurs tracks
+  via un channel broadcast — je peux l'ajouter si tu en as besoin.
+- **Pas de gestion de perte de paquets / réordonnancement RTP** au-delà de ce
+  que `webrtc-rs` fait nativement dans la track. Si ta source a du jitter
+  important, il faudra un jitter buffer explicite.
+- **`fmtp` recopié tel quel** depuis le SDP source. Si le navigateur cible ne
+  supporte pas le profil H264 exact annoncé (ex: High Profile), la connexion
+  s'établira mais l'image peut ne pas s'afficher — à vérifier avec ta source
+  réelle.
+- **Pas d'audio.** Si ton SDP a aussi une section `m=audio`, il faut dupliquer
+  le mécanisme (deuxième `VideoTrackInfo`-like struct, deuxième track, filtre
+  par PT séparé). Dis-le si c'est ton cas, je l'ajoute proprement.
+README_EOF
 
-# =============================================================================
-# 7. PARSING DES ARGUMENTS
-# =============================================================================
-
-parse_arguments() {
-    while (( $# > 0 )); do
-        case "$1" in
-            --dry-run) DRY_RUN=1; shift ;;
-            --help|-h) usage; exit $EXIT_OK ;;
-            *)         err "Argument inconnu : $1"
-                       usage
-                       exit $EXIT_USAGE ;;
-        esac
-    done
-}
+cat > .gitignore << 'GITIGNORE_EOF'
+/target
+source.sdp
+GITIGNORE_EOF
 
 
-# =============================================================================
-# 8. PIPELINE PRINCIPAL
-# =============================================================================
+if command -v git >/dev/null 2>&1; then
+  git init -q
+  git config user.email "dev@example.com"
+  git config user.name "rtp-bridge"
+  git add -A
+  git commit -q -m "Initial commit: RTP -> WebRTC bridge (Rust + webrtc-rs, single HTML page)"
+  echo "Repo git initialisé avec un premier commit."
+else
+  echo "git non trouvé, dossier créé sans init git."
+fi
 
-main() {
-    parse_arguments "$@"
-    ensure_root
-    ensure_tools_available
-    acquire_lock
-
-    section "Démarrage vérification RAID1 ($DISK_A + $DISK_B)"
-    (( DRY_RUN )) && warn "Mode DRY-RUN : aucune écriture réelle."
-
-    # --- Étape 1 : conditions de sortie immédiate ---
-    check_both_disks_present      # sort si un disque manque
-    check_disks_same_size         # sort si tailles différentes
-    check_no_sync_in_progress     # sort si resync en cours
-
-    # --- Étape 2 : réparation éventuelle des tables GPT et du layout ---
-    check_and_repair_partition_tables   # GPT entièrement absente
-    check_and_repair_partition_layout   # partitions manquantes individuellement
-
-    # --- Étape 3 : si tout est sain, on s'arrête ici ---
-    if ! any_array_needs_repair; then
-        section "RAID sain, aucune action nécessaire."
-        exit $EXIT_OK
-    fi
-
-    # --- Étape 4 : réparation de chaque array dégradé ---
-    local md
-    for md in $(list_active_md_arrays); do
-        repair_single_array "$md"
-    done
-
-    # --- Étape 5 : état final pour le log ---
-    section "État final"
-    cat /proc/mdstat
-}
-
-main "$@"
+echo "Projet généré dans ./$PROJECT_DIR"
+echo "Prochaines étapes:"
+echo "  1. cp <ton_fichier>.sdp $PROJECT_DIR/source.sdp"
+echo "  2. cd $PROJECT_DIR && cargo build --release"
+echo "  3. cargo run --release"
