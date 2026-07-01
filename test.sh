@@ -1,40 +1,3 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-# Crée l'arborescence complète du projet rtp-bridge dans le dossier courant.
-# Usage: ./gen_rtp_bridge.sh
-
-PROJECT_DIR="rtp-bridge"
-
-if [ -d "$PROJECT_DIR" ]; then
-  echo "Erreur: le dossier '$PROJECT_DIR' existe déjà. Supprime-le ou lance ce script ailleurs." >&2
-  exit 1
-fi
-
-mkdir -p "$PROJECT_DIR/src" "$PROJECT_DIR/static"
-cd "$PROJECT_DIR"
-
-cat > Cargo.toml << 'CARGO_EOF'
-[package]
-name = "rtp-bridge"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-tokio = { version = "1", features = ["full"] }
-webrtc = "0.11"
-sdp = "0.6"
-axum = { version = "0.7", features = ["ws"] }
-tokio-tungstenite = "0.23"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-anyhow = "1"
-tracing = "0.1"
-tracing-subscriber = "0.3"
-futures-util = "0.3"
-CARGO_EOF
-
-cat > src/main.rs << 'MAIN_EOF'
 mod sdp_parser;
 mod signaling;
 
@@ -279,10 +242,26 @@ async fn forward_rtp(
     info!("écoute RTP sur 0.0.0.0:{}", track_info.rtp_port);
 
     let mut buf = [0u8; 1500];
-    loop {
-        let (len, _addr) = socket.recv_from(&mut buf).await?;
-        let mut pkt_buf = &buf[..len];
 
+    // Compteurs de diagnostic, affichés périodiquement plutôt qu'à chaque
+    // paquet (sinon les logs explosent à 30-60 paquets/sec).
+    let mut total_received: u64 = 0;
+    let mut total_wrong_pt: u64 = 0;
+    let mut total_written: u64 = 0;
+    let mut total_write_errors: u64 = 0;
+    let mut last_report = tokio::time::Instant::now();
+    let report_interval = std::time::Duration::from_secs(2);
+
+    loop {
+        let (len, addr) = socket.recv_from(&mut buf).await?;
+        total_received += 1;
+
+        // Premier paquet reçu = confirmation que le bind UDP capte bien du trafic.
+        if total_received == 1 {
+            info!("premier paquet RTP reçu depuis {addr}, {len} octets");
+        }
+
+        let mut pkt_buf = &buf[..len];
         let packet = match webrtc::rtp::packet::Packet::unmarshal(&mut pkt_buf) {
             Ok(p) => p,
             Err(e) => {
@@ -292,292 +271,32 @@ async fn forward_rtp(
         };
 
         if packet.header.payload_type != track_info.payload_type {
-            // probablement un autre flux (ex: audio mêlé sur le même port) -> on ignore
+            total_wrong_pt += 1;
+            if total_wrong_pt == 1 {
+                warn!(
+                    "PT reçu={} ne correspond pas au PT attendu={} (issu du SDP) — paquet ignoré",
+                    packet.header.payload_type, track_info.payload_type
+                );
+            }
             continue;
         }
 
-        if let Err(e) = track.write_rtp(&packet).await {
-            warn!("écriture RTP vers la track a échoué: {e}");
+        match track.write_rtp(&packet).await {
+            Ok(_) => total_written += 1,
+            Err(e) => {
+                total_write_errors += 1;
+                if total_write_errors == 1 {
+                    warn!("écriture RTP vers la track a échoué: {e}");
+                }
+            }
+        }
+
+        if last_report.elapsed() >= report_interval {
+            info!(
+                "RTP stats [2s]: reçus={total_received} pt_invalide={total_wrong_pt} écrits={total_written} erreurs_écriture={total_write_errors} ssrc={} seq={} marker={}",
+                packet.header.ssrc, packet.header.sequence_number, packet.header.marker
+            );
+            last_report = tokio::time::Instant::now();
         }
     }
 }
-MAIN_EOF
-
-cat > src/sdp_parser.rs << 'SDPP_EOF'
-use anyhow::{anyhow, Context, Result};
-use sdp::description::session::SessionDescription;
-use std::io::Cursor;
-
-/// Ce qu'on extrait du .sdp source pour configurer la track WebRTC
-/// et filtrer les paquets RTP entrants.
-#[derive(Debug, Clone)]
-pub struct VideoTrackInfo {
-    pub payload_type: u8,
-    pub mime_type: String, // ex: "video/H264"
-    pub clock_rate: u32,
-    pub fmtp: Option<String>, // ex: "profile-level-id=42e01f;packetization-mode=1"
-    pub rtp_port: u16,
-}
-
-pub fn parse_sdp_file(sdp_content: &str) -> Result<VideoTrackInfo> {
-    let mut reader = Cursor::new(sdp_content.as_bytes());
-    let sdp = SessionDescription::unmarshal(&mut reader).context("SDP invalide ou illisible")?;
-
-    let media = sdp
-        .media_descriptions
-        .iter()
-        .find(|m| m.media_name.media == "video")
-        .ok_or_else(|| anyhow!("aucune section 'm=video' trouvée dans le SDP"))?;
-
-    let rtp_port = media.media_name.port.value as u16;
-
-    let pt_str = media
-        .media_name
-        .formats
-        .first()
-        .ok_or_else(|| anyhow!("aucun payload type déclaré pour la section video"))?;
-    let payload_type: u8 = pt_str.parse().context("payload type non numérique")?;
-
-    // Cherche l'attribut a=rtpmap:<pt> <codec>/<clockrate>
-    let rtpmap_value = media
-        .attributes
-        .iter()
-        .find(|a| a.key == "rtpmap")
-        .and_then(|a| a.value.clone())
-        .ok_or_else(|| anyhow!("aucun a=rtpmap trouvé pour PT {payload_type}"))?;
-
-    let mut parts = rtpmap_value.split_whitespace();
-    let found_pt: u8 = parts
-        .next()
-        .ok_or_else(|| anyhow!("rtpmap malformé"))?
-        .parse()
-        .context("PT du rtpmap non numérique")?;
-    if found_pt != payload_type {
-        return Err(anyhow!(
-            "incohérence: PT déclaré dans m=video ({payload_type}) != PT du rtpmap ({found_pt})"
-        ));
-    }
-
-    let codec_clock = parts
-        .next()
-        .ok_or_else(|| anyhow!("rtpmap sans partie codec/clockrate"))?;
-    let mut codec_parts = codec_clock.split('/');
-    let codec_name = codec_parts
-        .next()
-        .ok_or_else(|| anyhow!("rtpmap sans nom de codec"))?
-        .to_uppercase();
-    let clock_rate: u32 = codec_parts
-        .next()
-        .unwrap_or("90000")
-        .parse()
-        .unwrap_or(90000);
-
-    // fmtp optionnel (important pour H264 : profile-level-id, packetization-mode)
-    let fmtp = media
-        .attributes
-        .iter()
-        .find(|a| a.key == "fmtp")
-        .and_then(|a| a.value.clone())
-        .and_then(|v| v.split_once(' ').map(|(_, params)| params.to_string()));
-
-    Ok(VideoTrackInfo {
-        payload_type,
-        mime_type: format!("video/{codec_name}"),
-        clock_rate,
-        fmtp,
-        rtp_port,
-    })
-}
-SDPP_EOF
-
-cat > src/signaling.rs << 'SIG_EOF'
-use serde::{Deserialize, Serialize};
-use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
-
-/// Messages échangés sur le WebSocket de signaling, dans les deux sens.
-/// Le tag "type" permet au JS de faire un simple switch sur le champ.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-pub enum SignalMsg {
-    Offer { sdp: String },
-    Answer { sdp: String },
-    Ice { candidate: RTCIceCandidateInit },
-}
-SIG_EOF
-
-cat > static/index.html << 'HTML_EOF'
-<!DOCTYPE html>
-<html lang="fr">
-<head>
-<meta charset="UTF-8">
-<title>RTP → WebRTC Viewer</title>
-<style>
-  body { font-family: sans-serif; background: #111; color: #eee; text-align: center; }
-  video { width: 80%; max-width: 900px; margin-top: 20px; background: #000; }
-  #status { font-family: monospace; margin-top: 10px; color: #8f8; }
-  #status.error { color: #f88; }
-</style>
-</head>
-<body>
-  <h1>Flux RTP relayé en WebRTC</h1>
-  <video id="video" autoplay playsinline controls></video>
-  <div id="status">connexion...</div>
-
-<script>
-(() => {
-  const videoEl = document.getElementById('video');
-  const statusEl = document.getElementById('status');
-
-  const setStatus = (text, isError = false) => {
-    statusEl.textContent = text;
-    statusEl.className = isError ? 'error' : '';
-  };
-
-  const wsProtocol = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(`${wsProtocol}://${location.host}/ws`);
-
-  const pc = new RTCPeerConnection({
-    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
-  });
-
-  // On ne fait que recevoir de la vidéo, on n'envoie rien depuis le navigateur.
-  pc.addTransceiver('video', { direction: 'recvonly' });
-
-  pc.ontrack = (event) => {
-    videoEl.srcObject = event.streams[0];
-    setStatus('flux reçu, lecture en cours');
-  };
-
-  pc.oniceconnectionstatechange = () => {
-    setStatus(`ICE: ${pc.iceConnectionState}`, pc.iceConnectionState === 'failed');
-  };
-
-  pc.onicecandidate = (event) => {
-    if (event.candidate) {
-      ws.send(JSON.stringify({ type: 'ice', candidate: event.candidate.toJSON() }));
-    }
-  };
-
-  ws.onopen = () => setStatus('websocket connecté, attente de l\'offer serveur');
-
-  ws.onerror = () => setStatus('erreur websocket', true);
-
-  ws.onclose = () => setStatus('websocket fermé', true);
-
-  ws.onmessage = async (msg) => {
-    let data;
-    try {
-      data = JSON.parse(msg.data);
-    } catch (e) {
-      console.error('message de signaling illisible', e);
-      return;
-    }
-
-    switch (data.type) {
-      case 'offer': {
-        await pc.setRemoteDescription({ type: 'offer', sdp: data.sdp });
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        ws.send(JSON.stringify({ type: 'answer', sdp: answer.sdp }));
-        setStatus('answer envoyée, négociation ICE en cours');
-        break;
-      }
-      case 'ice': {
-        try {
-          await pc.addIceCandidate(data.candidate);
-        } catch (e) {
-          console.warn('ICE candidate rejetée', e);
-        }
-        break;
-      }
-      default:
-        console.warn('type de message inconnu:', data.type);
-    }
-  };
-})();
-</script>
-</body>
-</html>
-HTML_EOF
-
-cat > source.sdp.example << 'SDPEX_EOF'
-v=0
-o=- 0 0 IN IP4 127.0.0.1
-s=RTP Stream
-c=IN IP4 127.0.0.1
-t=0 0
-m=video 5004 RTP/AVP 96
-a=rtpmap:96 H264/90000
-a=fmtp:96 profile-level-id=42e01f;packetization-mode=1
-SDPEX_EOF
-
-cat > README.md << 'README_EOF'
-# rtp-bridge
-
-Relaie un flux RTP (vidéo) vers une page web via WebRTC, sans passer par un SFU externe.
-
-## Utilisation
-
-1. Place ton fichier SDP source à la racine sous le nom `source.sdp`
-   (voir `source.sdp.example` pour le format attendu).
-2. `cargo build --release`
-3. `cargo run --release`
-4. Ouvre `http://localhost:8080` dans un navigateur.
-5. Pointe ta source RTP vers `udp://<ip-du-serveur>:<port du m=video dans le SDP>`.
-
-## Ce que fait le code
-
-- `src/sdp_parser.rs` : lit le `.sdp`, en extrait le payload type, le codec
-  (mime_type), le clock rate, le `fmtp` et le port RTP attendu.
-- `src/main.rs` :
-  - configure un `MediaEngine` webrtc-rs avec **exactement** le codec déclaré
-    dans le SDP (pas de négociation multi-codec, pas de devinette),
-  - ouvre une session par connexion WebSocket entrante (`/ws`),
-  - crée une `PeerConnection` + une `TrackLocalStaticRTP` en mode `sendonly`,
-  - fait l'offer/answer + trickle ICE avec le navigateur via WebSocket,
-  - écoute le port UDP indiqué dans le SDP, filtre les paquets par payload
-    type, et les réinjecte tels quels dans la track (pas de transcodage).
-- `static/index.html` : page unique, `RTCPeerConnection` natif du navigateur,
-  pas de SDK externe. Affiche le flux dans une balise `<video>`.
-
-## Limites connues / points à durcir si besoin
-
-- **Un seul flux RTP consommé par session WebSocket.** Si deux navigateurs se
-  connectent en même temps, chacun ouvre son propre `bind()` UDP sur le même
-  port → ça va échouer au 2e `bind`. Pour du multi-viewer, il faut découpler
-  la lecture UDP (une seule tâche globale) du fan-out vers plusieurs tracks
-  via un channel broadcast — je peux l'ajouter si tu en as besoin.
-- **Pas de gestion de perte de paquets / réordonnancement RTP** au-delà de ce
-  que `webrtc-rs` fait nativement dans la track. Si ta source a du jitter
-  important, il faudra un jitter buffer explicite.
-- **`fmtp` recopié tel quel** depuis le SDP source. Si le navigateur cible ne
-  supporte pas le profil H264 exact annoncé (ex: High Profile), la connexion
-  s'établira mais l'image peut ne pas s'afficher — à vérifier avec ta source
-  réelle.
-- **Pas d'audio.** Si ton SDP a aussi une section `m=audio`, il faut dupliquer
-  le mécanisme (deuxième `VideoTrackInfo`-like struct, deuxième track, filtre
-  par PT séparé). Dis-le si c'est ton cas, je l'ajoute proprement.
-README_EOF
-
-cat > .gitignore << 'GITIGNORE_EOF'
-/target
-source.sdp
-GITIGNORE_EOF
-
-
-if command -v git >/dev/null 2>&1; then
-  git init -q
-  git config user.email "dev@example.com"
-  git config user.name "rtp-bridge"
-  git add -A
-  git commit -q -m "Initial commit: RTP -> WebRTC bridge (Rust + webrtc-rs, single HTML page)"
-  echo "Repo git initialisé avec un premier commit."
-else
-  echo "git non trouvé, dossier créé sans init git."
-fi
-
-echo "Projet généré dans ./$PROJECT_DIR"
-echo "Prochaines étapes:"
-echo "  1. cp <ton_fichier>.sdp $PROJECT_DIR/source.sdp"
-echo "  2. cd $PROJECT_DIR && cargo build --release"
-echo "  3. cargo run --release"
