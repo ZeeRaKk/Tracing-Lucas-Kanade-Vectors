@@ -157,10 +157,33 @@ async fn run_session(socket: WebSocket, state: AppState) -> Result<()> {
         Box::pin(async move {
             if let Some(candidate) = candidate {
                 if let Ok(init) = candidate.to_json() {
+                    info!(
+                        "candidate ICE générée: type={:?} protocol={:?} address={:?}",
+                        init.candidate.split(' ').nth(7),
+                        init.candidate.split(' ').nth(2),
+                        init.candidate.split(' ').nth(4)
+                    );
                     let _ = ice_out_tx.send(SignalMsg::Ice { candidate: init });
                 }
             }
         })
+    }));
+
+    // Diagnostic: on veut voir précisément où ça casse entre gathering,
+    // connectivity checks ICE, handshake DTLS, et l'état agrégé final.
+    pc.on_ice_gathering_state_change(Box::new(move |state| {
+        info!("ICE gathering state: {state}");
+        Box::pin(async {})
+    }));
+
+    pc.on_ice_connection_state_change(Box::new(move |state| {
+        info!("ICE connection state: {state}");
+        Box::pin(async {})
+    }));
+
+    pc.on_peer_connection_state_change(Box::new(move |state| {
+        info!("Peer connection state (ICE+DTLS agrégé): {state}");
+        Box::pin(async {})
     }));
 
     // ---- Crée l'offer et l'envoie au navigateur ----
