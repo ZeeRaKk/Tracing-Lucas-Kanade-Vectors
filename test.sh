@@ -25,7 +25,7 @@ use webrtc::{
     interceptor::registry::Registry,
     peer_connection::{configuration::RTCConfiguration, sdp::session_description::RTCSessionDescription},
     rtp_transceiver::{
-        rtp_codec::{RTCRtpCodecCapability, RTCRtpCodecParameters, RTPCodecType},
+        rtp_codec::RTCRtpCodecCapability,
         rtp_transceiver_direction::RTCRtpTransceiverDirection,
         RTCRtpTransceiverInit,
     },
@@ -95,23 +95,13 @@ async fn handle_signaling(socket: WebSocket, state: AppState) {
 async fn run_session(socket: WebSocket, state: AppState) -> Result<()> {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
-    // ---- Setup MediaEngine avec le codec exact déduit du SDP source ----
+    // ---- Setup MediaEngine avec le set de codecs par défaut de webrtc-rs ----
+    // On n'enregistre plus le codec "à la main" à partir du SDP source : les
+    // paramètres par défaut (clock rate, fmtp standard) sont ceux que les
+    // navigateurs attendent réellement. On garde le SDP source uniquement
+    // pour connaître le payload type et le port UDP à écouter (cf. plus bas).
     let mut media_engine = MediaEngine::default();
-    let capability = RTCRtpCodecCapability {
-        mime_type: state.track_info.mime_type.clone(),
-        clock_rate: state.track_info.clock_rate,
-        channels: 0,
-        sdp_fmtp_line: state.track_info.fmtp.clone().unwrap_or_default(),
-        rtcp_feedback: vec![],
-    };
-    media_engine.register_codec(
-        RTCRtpCodecParameters {
-            capability: capability.clone(),
-            payload_type: state.track_info.payload_type,
-            ..Default::default()
-        },
-        RTPCodecType::Video,
-    )?;
+    media_engine.register_default_codecs()?;
 
     let mut registry = Registry::new();
     registry = register_default_interceptors(registry, &mut media_engine)?;
@@ -131,9 +121,18 @@ async fn run_session(socket: WebSocket, state: AppState) -> Result<()> {
 
     let pc = Arc::new(api.new_peer_connection(config).await?);
 
-    // Track locale alimentée par le flux RTP source
+    // Track locale: le mime_type doit matcher un codec connu de
+    // register_default_codecs() (H264, VP8, VP9, Opus...) pour que le
+    // navigateur puisse le négocier dans son answer.
+    let video_capability = RTCRtpCodecCapability {
+        mime_type: state.track_info.mime_type.clone(),
+        clock_rate: state.track_info.clock_rate,
+        channels: 0,
+        sdp_fmtp_line: state.track_info.fmtp.clone().unwrap_or_default(),
+        rtcp_feedback: vec![],
+    };
     let video_track = Arc::new(TrackLocalStaticRTP::new(
-        capability,
+        video_capability,
         "video".to_owned(),
         "rtp-bridge".to_owned(),
     ));
