@@ -507,3 +507,104 @@
   </xs:simpleType>
 
 </xs:schema>
+
+
+
+EXIGENCES - SCHÃ‰MA DE CONFIGURATION
+===================================
+
+Fichiers   : schema.xsd (schÃ©ma), exemple.xml (document valide)
+Version    : XSD 1.1 requis (xs:alternative, xs:assert)
+RÃ©fÃ©rences : les identifiants EX-xx sont repris dans la documentation
+             du schÃ©ma (xs:documentation).
+
+
+1. STRUCTURE GÃ‰NÃ‰RALE
+---------------------
+
+EX-01  Le document a une racine unique `root`. Elle contient, dans cet ordre :
+         - un Ã©lÃ©ment `profiles` (obligatoire) ;
+         - 0 Ã  n noeuds `A`.
+
+EX-02  `profiles` contient 0 Ã  n `profile`. Chaque profil est un identifiant
+       texte (non vide, sans espace) et n'est dÃ©fini qu'une seule fois.
+
+
+2. NOEUDS A
+-----------
+
+EX-03  Un noeud `A` porte deux attributs obligatoires :
+         - `name` : texte, non unique ;
+         - `id`   : identifiant, unique parmi tous les noeuds A du document.
+
+EX-04  Un noeud `A` contient, dans cet ordre :
+         - 0 ou 1 Ã©lÃ©ment `type` (EX-11) ;
+         - 0 Ã  n `parameter` ;
+         - 0 Ã  n noeuds `A` enfants (rÃ©cursion, profondeur illimitÃ©e).
+
+EX-11  L'Ã©lÃ©ment `type` d'un noeud est un texte libre, facultatif, prÃ©sent
+       au plus une fois et placÃ© en premier.
+
+
+3. PARAMÃˆTRES
+-------------
+
+EX-05  Un `parameter` porte trois attributs obligatoires :
+         - `id`   : identifiant, unique parmi tous les paramÃ¨tres du document ;
+         - `name` : identifiant, non unique ;
+         - `type` : int | float | string | hexadecimal.
+
+EX-06  Un `parameter` contient une `value` dont le format dÃ©pend de `type` :
+         - int         : entier signÃ© 32 bits (i32) ;
+         - float       : flottant 32 bits (f32) ;
+         - string      : texte libre ;
+         - hexadecimal : chiffres [0-9A-Fa-f]+, sans prÃ©fixe 0x.
+
+EX-07  Pour int et float uniquement, `value` est suivie de `min` puis `max`,
+       tous deux obligatoires et du mÃªme type que la valeur.
+       Chaque borne porte l'attribut obligatoire `inclusive` :
+         - true  : borne incluse ;
+         - false : borne exclue ;
+         - 1 et 0 sont refusÃ©s.
+       Les bornes sont interdites pour string et hexadecimal.
+
+EX-08  La valeur doit respecter ses bornes selon leur inclusivitÃ©.
+       Exemple : min=0 avec inclusive="false" refuse value=0.
+
+
+4. PROFILS ET DROITS
+--------------------
+
+EX-09  Un `parameter` se termine par 0 Ã  n `profile`, chacun portant
+       l'attribut obligatoire `right` :
+         - r  : lecture seule ;
+         - rw : lecture et Ã©criture.
+
+EX-10  Un profil citÃ© dans un paramÃ¨tre doit Ãªtre dÃ©fini dans `profiles`
+       (EX-02) et n'apparaÃ®t qu'une fois par paramÃ¨tre. Un mÃªme profil peut
+       figurer dans plusieurs paramÃ¨tres.
+
+
+5. CHOIX TECHNIQUES
+-------------------
+
+- Noms d'Ã©lÃ©ments et d'attributs en anglais.
+- Seul `root` est dÃ©clarÃ© globalement : c'est la seule racine de document
+  valide.
+- Les id des noeuds A et ceux des paramÃ¨tres forment deux espaces sÃ©parÃ©s :
+  un A et un parameter peuvent porter le mÃªme id.
+- UnicitÃ© des id par xs:unique et non xs:ID (xs:ID interdit les id
+  commenÃ§ant par un chiffre, par exemple "42").
+- EX-10 est vÃ©rifiÃ©e par xs:assert plutÃ´t que xs:keyref : certains
+  validateurs ignorent les contraintes d'identitÃ© sous un Ã©lÃ©ment typÃ©
+  par xs:alternative.
+
+
+6. VALIDATION
+-------------
+
+ValidÃ© avec xmlschema 4.3.2 (Python, support XSD 1.1) sur 33 cas de test,
+valides et invalides.
+
+  pip install xmlschema
+  python3 -c "import xmlschema; xmlschema.XMLSchema11('schema.xsd').validate('exemple.xml')"
