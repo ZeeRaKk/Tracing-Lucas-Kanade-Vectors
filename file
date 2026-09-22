@@ -608,3 +608,48 @@ valides et invalides.
 
   pip install xmlschema
   python3 -c "import xmlschema; xmlschema.XMLSchema11('schema.xsd').validate('exemple.xml')"
+
+
+
+
+
+<?xml version="1.0" encoding="UTF-8"?>
+<root xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:noNamespaceSchemaLocation="schema.xsd">
+
+  <profiles>
+    <profile>admin</profile>
+    <profile>guest</profile>
+  </profiles>
+
+  <A name="Moteur" id="a1">
+    <type>moteur</type>
+
+    <parameter id="p1" name="parametrevol2" type="int">
+      <value>42</value>
+      <min inclusive="true">0</min>
+      <max inclusive="false">100</max>
+      <profile right="rw">admin</profile>
+      <profile right="r">guest</profile>
+    </parameter>
+
+    <parameter id="p2" name="gain" type="float">
+      <value>0.75</value>
+      <min inclusive="false">0.0</min>
+      <max inclusive="true">1.0</max>
+    </parameter>
+
+    <A name="Sous-module" id="a2">
+      <!-- même name que p2 : autorisé, seul l'id est unique (EX-05) -->
+      <parameter id="p3" name="gain" type="string">
+        <value>bonjour le monde</value>
+        <profile right="r">guest</profile>
+      </parameter>
+
+      <parameter id="p4" name="register" type="hexadecimal">
+        <value>1A3F</value>
+        <profile right="rw">admin</profile>
+      </parameter>
+    </A>
+  </A>
+</root>
