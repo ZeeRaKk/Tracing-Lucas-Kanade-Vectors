@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
-# creer-kit.sh — recrée tous les fichiers du kit k3s airgap + temps réel.
+# creer-rtlat.sh — recrée le projet rtlat (Rust + clap) et son script de tracé.
 #
-# Usage : bash creer-kit.sh [DOSSIER]        (défaut : ./kit-k3s-rt)
-#
-# Contenu : scripts d'installation airgap, manifests Kubernetes, outil de mesure
-# rtlat (source Rust + script de tracé). Voir LISEZMOI.md une fois le kit créé.
+# Usage : bash creer-rtlat.sh [DOSSIER]      (défaut : ./rtlat)
+# Puis  : cd DOSSIER && cargo build --release
 set -euo pipefail
 
-DEST="${1:-./kit-k3s-rt}"
+DEST="${1:-./rtlat}"
 if [[ -e "$DEST" && -n "$(ls -A "$DEST" 2>/dev/null)" ]]; then
   echo "Le dossier $DEST existe et n'est pas vide : choisis-en un autre ou supprime-le." >&2
   exit 1
@@ -15,838 +13,24 @@ fi
 mkdir -p "$DEST"
 cd "$DEST"
 
-ecrire() {  # ecrire <chemin> : lit le contenu sur l'entrée standard
+ecrire() {  # ecrire <chemin> : contenu lu sur l'entrée standard
   mkdir -p "$(dirname "$1")"
   cat > "$1"
   echo "  $1"
 }
 
-echo "Création du kit dans $(pwd) :"
+echo "Création du projet rtlat dans $(pwd) :"
 
-ecrire 'LISEZMOI.md' <<'__FIN_FICHIER_00__'
-# Kit k3s airgap + temps réel
-
-## Contenu
-
-```
-k3s-airgap/
-  telecharger-k3s-airgap.sh   machine CONNECTÉE : prépare le bundle pour la clé USB
-  install-k3s-airgap.sh       nœud AIRGAP : installe k3s depuis la clé (serveur ou agent)
-  images.txt                  images à embarquer (nom complet obligatoire)
-  Containerfile.rt-base       image de base avec taskset/chrt (à construire avant le téléchargement)
-manifests/
-  nginx-deploy.yml            premier test : nginx + NodePort 30080
-  monapp-deploy.yml           binaire fourni par l'hôte (/opt/monapp), lancement manuel
-  monapp-pinned-deploy.yml    RT : affinité explicite par conteneur (taskset), cœurs 6-7 isolés
-  variantes-cpu-manager/      alternatives avec le CPU Manager static (cœurs choisis par k3s)
-    rt-app-deploy.yml
-    monapp-rt-deploy.yml
-rtlat/
-  Cargo.toml, Cargo.lock, src/main.rs   outil de mesure (check, timer, pingpong, stall, load)
-  rtlat_plot.py               tracés matplotlib à partir des JSON (--out)
-  README.md                   utilisation et lecture des résultats
-```
-
-## Ordre d'utilisation
-
-1. Machine connectée :
-   ```bash
-   cd k3s-airgap
-   podman build -t registry.local/rt-base:9 -f Containerfile.rt-base .
-   ./telecharger-k3s-airgap.sh          # ou K3S_VERSION=v1.xx.y+k3s1 ./telecharger-k3s-airgap.sh
-   (cd ../rtlat && cargo build --release && cp target/release/rtlat ../k3s-airgap/k3s-airgap-bundle/)
-   ```
-   Copier `k3s-airgap/k3s-airgap-bundle/` et `manifests/` sur la clé.
-2. Nœud airgap : `sudo bash <clé>/k3s-airgap-bundle/install-k3s-airgap.sh`
-3. Noyau (isolation), puis reboot — voir l'en-tête de `manifests/monapp-pinned-deploy.yml`.
-4. Binaires dans `/opt/monapp`, puis `kubectl apply -f manifests/monapp-pinned-deploy.yml`.
-5. Mesure : `rtlat check --cpu 7`, puis `rtlat timer --cpu 7 --duration 3600 --out repos.json`.
-6. Tracé (machine avec matplotlib) : `python3 rtlat/rtlat_plot.py repos.json`.
-__FIN_FICHIER_00__
-
-ecrire 'k3s-airgap/telecharger-k3s-airgap.sh' <<'__FIN_FICHIER_01__'
-#!/usr/bin/env bash
-# telecharger-k3s-airgap.sh — à lancer sur une machine CONNECTÉE.
-# Prépare un bundle k3s airgap à copier tel quel sur la clé USB.
-#
-# Usage :
-#   ./telecharger-k3s-airgap.sh                          # dernière stable, amd64
-#   K3S_VERSION=v1.33.5+k3s1 ARCH=arm64 ./telecharger-k3s-airgap.sh
-#
-# Variables :
-#   K3S_VERSION  version k3s (défaut : canal stable)
-#   ARCH         amd64 | arm64 (défaut : amd64)
-#   EL           version EL du RPM k3s-selinux ; EL= (vide) pour ne pas le prendre (défaut : 9)
-#   OUT          dossier de sortie (défaut : ./k3s-airgap-bundle)
-#   IMAGES_FILE  images supplémentaires, une par ligne (défaut : images.txt à côté du script)
-#
-# Placer install-k3s-airgap.sh à côté de ce script : il sera copié dans le bundle.
-set -euo pipefail
-
-ARCH="${ARCH:-amd64}"
-EL="${EL-9}"
-OUT="${OUT:-./k3s-airgap-bundle}"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-IMAGES_FILE="${IMAGES_FILE:-$SCRIPT_DIR/images.txt}"
-
-log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
-warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*" >&2; }
-die()  { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
-
-for cmd in curl sha256sum awk; do
-  command -v "$cmd" >/dev/null || die "commande manquante : $cmd"
-done
-
-case "$ARCH" in
-  amd64) BIN_NAME=k3s ;;
-  arm64) BIN_NAME=k3s-arm64 ;;
-  *) die "ARCH non supportée : $ARCH (amd64 ou arm64)" ;;
-esac
-
-# --- Version ---------------------------------------------------------------
-if [[ -z "${K3S_VERSION:-}" ]]; then
-  log "Résolution de la dernière version stable…"
-  K3S_VERSION="$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
-      https://update.k3s.io/v1-release/channels/stable \
-    | sed -e 's|.*/||' -e 's/%2B/+/')" \
-    || die "update.k3s.io injoignable : fixe la version avec K3S_VERSION=v1.xx.y+k3s1"
-  [[ "$K3S_VERSION" == v* ]] || die "version stable introuvable (obtenu : '$K3S_VERSION')"
-fi
-log "k3s $K3S_VERSION ($ARCH)"
-
-BASE="https://github.com/k3s-io/k3s/releases/download/${K3S_VERSION/+/%2B}"
-mkdir -p "$OUT"/{bin,images,rpms}
-OUT="$(cd "$OUT" && pwd)"
-TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
-
-fetch() { curl -fL --retry 3 --progress-bar -o "$2" "$1"; }
-
-verify() { # verify <fichier local> <nom dans sha256sum-ARCH.txt>
-  local expected actual
-  expected="$(awk -v f="$2" '$2 == f {print $1}' "$TMP/sums")"
-  [[ -n "$expected" ]] || die "pas de somme de contrôle pour $2"
-  actual="$(sha256sum "$1" | cut -d' ' -f1)"
-  [[ "$expected" == "$actual" ]] || die "somme de contrôle invalide : $2"
-}
-
-# --- k3s : binaire + images système -----------------------------------------
-log "Téléchargement du binaire et des images système"
-fetch "$BASE/sha256sum-$ARCH.txt" "$TMP/sums"
-fetch "$BASE/$BIN_NAME" "$OUT/bin/$BIN_NAME"
-fetch "$BASE/k3s-airgap-images-$ARCH.tar.zst" "$OUT/images/k3s-airgap-images-$ARCH.tar.zst"
-verify "$OUT/bin/$BIN_NAME" "$BIN_NAME"
-verify "$OUT/images/k3s-airgap-images-$ARCH.tar.zst" "k3s-airgap-images-$ARCH.tar.zst"
-log "Sommes de contrôle officielles OK"
-
-log "Téléchargement du script d'installation officiel"
-fetch https://get.k3s.io "$OUT/k3s-install.sh"
-
-# --- RPM k3s-selinux (OL/RHEL avec SELinux actif) ---------------------------
-if [[ -n "$EL" ]]; then
-  log "Recherche du RPM k3s-selinux (el$EL)"
-  rpm_url="$(curl -fsSL https://api.github.com/repos/k3s-io/k3s-selinux/releases/latest \
-    | grep -o "\"browser_download_url\": *\"[^\"]*\.el${EL}\.noarch\.rpm\"" \
-    | sed 's/.*"\(https[^"]*\)"$/\1/' | head -n1 || true)"
-  if [[ -n "$rpm_url" ]]; then
-    fetch "$rpm_url" "$OUT/rpms/${rpm_url##*/}"
-  else
-    warn "RPM k3s-selinux el$EL introuvable : à récupérer à la main dans rpms/"
-  fi
-fi
-
-# --- Images supplémentaires -------------------------------------------------
-if [[ -f "$IMAGES_FILE" ]]; then
-  command -v podman >/dev/null || die "podman requis pour traiter $IMAGES_FILE"
-  log "Images supplémentaires depuis $IMAGES_FILE"
-  while IFS= read -r -u 3 img || [[ -n "$img" ]]; do
-    img="${img%%#*}"                                   # retire les commentaires
-    img="${img#"${img%%[![:space:]]*}"}"               # trim gauche
-    img="${img%"${img##*[![:space:]]}"}"               # trim droite
-    [[ -z "$img" ]] && continue
-
-    first="${img%%/*}"
-    if [[ "$img" != */* || ( "$first" != *.* && "$first" != *:* && "$first" != localhost ) ]]; then
-      die "nom non qualifié : '$img' (ex : docker.io/library/nginx:alpine)"
-    fi
-
-    if podman image exists "$img"; then
-      log "  locale : $img"
-    else
-      log "  pull   : $img"
-      podman pull --arch "$ARCH" "$img"
-    fi
-    file="$OUT/images/$(tr '/:@' '___' <<<"$img").tar"
-    rm -f "$file"
-    podman save --format docker-archive -o "$file" "$img"
-  done 3< "$IMAGES_FILE"
-else
-  log "Pas de $IMAGES_FILE : aucune image supplémentaire"
-fi
-
-# --- Script d'installation + métadonnées -------------------------------------
-if [[ -f "$SCRIPT_DIR/install-k3s-airgap.sh" ]]; then
-  cp "$SCRIPT_DIR/install-k3s-airgap.sh" "$OUT/"
-else
-  warn "install-k3s-airgap.sh absent à côté de ce script : copie-le dans le bundle à la main"
-fi
-
-cat > "$OUT/bundle.env" <<EOF
-K3S_VERSION=$K3S_VERSION
-ARCH=$ARCH
-EOF
-
-# Sommes de tout le bundle, pour détecter une copie USB corrompue.
-# config.yaml et le script d'install sont exclus pour pouvoir les éditer.
-log "Calcul des sommes de contrôle du bundle"
-(cd "$OUT" && find . -type f ! -name SHA256SUMS ! -name config.yaml \
-    ! -name install-k3s-airgap.sh -print0 | sort -z | xargs -0 sha256sum > "$TMP/sums.all")
-mv "$TMP/sums.all" "$OUT/SHA256SUMS"
-
-log "Bundle prêt : $OUT ($(du -sh "$OUT" | cut -f1))"
-echo
-echo "Copie le DOSSIER sur la clé, puis sur le nœud airgap :"
-echo "  sudo bash /run/media/\$USER/<CLE>/$(basename "$OUT")/install-k3s-airgap.sh"
-__FIN_FICHIER_01__
-chmod +x 'k3s-airgap/telecharger-k3s-airgap.sh'
-
-ecrire 'k3s-airgap/install-k3s-airgap.sh' <<'__FIN_FICHIER_02__'
-#!/usr/bin/env bash
-# install-k3s-airgap.sh — à lancer en root sur le nœud AIRGAP, depuis la clé USB.
-#
-#   sudo bash /chemin/cle/k3s-airgap-bundle/install-k3s-airgap.sh            # serveur
-#   sudo bash /chemin/cle/k3s-airgap-bundle/install-k3s-airgap.sh agent \
-#        --url https://<IP_SERVEUR>:6443 --token <TOKEN>                     # agent
-#
-# Options :
-#   --no-firewall   ne touche pas à firewalld
-#   --skip-verify   saute la vérification SHA256 du bundle
-#
-# Un config.yaml optionnel placé à côté de ce script est copié dans
-# /etc/rancher/k3s/config.yaml (ex : write-kubeconfig-mode, node-name, tls-san…).
-set -euo pipefail
-
-BUNDLE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-IMAGES_DST=/var/lib/rancher/k3s/agent/images
-K3S=/usr/local/bin/k3s
-# Plages par défaut de k3s ; à adapter si tu changes cluster-cidr / service-cidr.
-POD_CIDR=10.42.0.0/16
-SVC_CIDR=10.43.0.0/16
-
-ROLE=server SERVER_URL="" TOKEN="" DO_FW=1 DO_VERIFY=1
-
-log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
-warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*" >&2; }
-die()  { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
-usage() { grep '^#' "$0" | sed -e '1d' -e 's/^# \{0,1\}//'; exit "${1:-0}"; }
-
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    server|agent)  ROLE="$1" ;;
-    --url)         SERVER_URL="${2:?--url attend une valeur}"; shift ;;
-    --token)       TOKEN="${2:?--token attend une valeur}"; shift ;;
-    --no-firewall) DO_FW=0 ;;
-    --skip-verify) DO_VERIFY=0 ;;
-    -h|--help)     usage 0 ;;
-    *)             warn "argument inconnu : $1"; usage 1 ;;
-  esac
-  shift
-done
-
-# --- 1. Vérifications ---------------------------------------------------------
-[[ $EUID -eq 0 ]] || die "à lancer en root : sudo bash $0"
-[[ -f "$BUNDLE_DIR/bundle.env" ]] || die "bundle.env introuvable dans $BUNDLE_DIR"
-# shellcheck source=/dev/null
-source "$BUNDLE_DIR/bundle.env"
-
-if [[ "$ROLE" == agent && ( -z "$SERVER_URL" || -z "$TOKEN" ) ]]; then
-  die "un agent a besoin de --url et --token"
-fi
-
-case "$(uname -m)" in
-  x86_64)  HOST_ARCH=amd64 ;;
-  aarch64) HOST_ARCH=arm64 ;;
-  *)       HOST_ARCH="$(uname -m)" ;;
-esac
-[[ "$HOST_ARCH" == "$ARCH" ]] || die "bundle $ARCH mais machine $HOST_ARCH"
-
-if [[ $DO_VERIFY -eq 1 ]]; then
-  log "Vérification de l'intégrité du bundle"
-  (cd "$BUNDLE_DIR" && sha256sum -c --quiet SHA256SUMS) \
-    || die "bundle corrompu : recopie la clé (ou --skip-verify à tes risques)"
-fi
-
-ip route show default | grep -q . \
-  || die "aucune route par défaut, k3s en a besoin. Ex : nmcli con mod <con> ipv4.gateway <IP> && nmcli con up <con>"
-
-log "Installation k3s $K3S_VERSION ($ARCH) en mode $ROLE"
-
-# --- 2. SELinux ---------------------------------------------------------------
-if command -v getenforce >/dev/null && [[ "$(getenforce)" != Disabled ]]; then
-  if rpm -q k3s-selinux >/dev/null 2>&1; then
-    log "k3s-selinux déjà installé"
-  else
-    shopt -s nullglob
-    rpms=("$BUNDLE_DIR"/rpms/*.rpm)
-    shopt -u nullglob
-    (( ${#rpms[@]} )) || die "SELinux actif mais aucun RPM dans rpms/"
-    log "Installation de k3s-selinux"
-    dnf install -y --disablerepo='*' "${rpms[@]}" \
-      || die "échec RPM : container-selinux manquant ? Installe-le depuis l'ISO OL9 (AppStream) ou ajoute son RPM dans rpms/"
-  fi
-fi
-
-# --- 3. Binaire + images -------------------------------------------------------
-bin_src="$BUNDLE_DIR/bin/k3s"
-[[ "$ARCH" == arm64 ]] && bin_src="$BUNDLE_DIR/bin/k3s-arm64"
-install -m 0755 "$bin_src" "$K3S"
-
-log "Copie des images vers $IMAGES_DST"
-install -d -m 0755 "$IMAGES_DST"
-cp -f "$BUNDLE_DIR"/images/* "$IMAGES_DST"/
-if command -v restorecon >/dev/null; then restorecon -R /var/lib/rancher; fi
-
-# --- 4. Config optionnelle ----------------------------------------------------
-if [[ -f "$BUNDLE_DIR/config.yaml" ]]; then
-  log "Copie de config.yaml"
-  install -d -m 0755 /etc/rancher/k3s
-  install -m 0600 "$BUNDLE_DIR/config.yaml" /etc/rancher/k3s/config.yaml
-fi
-
-# --- 5. Firewall --------------------------------------------------------------
-if [[ $DO_FW -eq 1 ]] && systemctl is-active --quiet firewalld; then
-  log "Ouverture des ports dans firewalld"
-  # 30000-32767 : plage NodePort, nécessaire pour joindre un Service NodePort depuis l'extérieur
-  ports=(10250/tcp 8472/udp 30000-32767/tcp)
-  [[ "$ROLE" == server ]] && ports+=(6443/tcp)
-  for p in "${ports[@]}"; do firewall-cmd -q --permanent --add-port="$p"; done
-  firewall-cmd -q --permanent --zone=trusted --add-source="$POD_CIDR"
-  firewall-cmd -q --permanent --zone=trusted --add-source="$SVC_CIDR"
-  firewall-cmd -q --reload
-fi
-
-# --- 6. Installation k3s ------------------------------------------------------
-export INSTALL_K3S_SKIP_DOWNLOAD=true INSTALL_K3S_SKIP_SELINUX_RPM=true
-if [[ "$ROLE" == agent ]]; then
-  K3S_URL="$SERVER_URL" K3S_TOKEN="$TOKEN" sh "$BUNDLE_DIR/k3s-install.sh"
-  log "Agent installé. Vérifie depuis le serveur : kubectl get nodes"
-  exit 0
-fi
-sh "$BUNDLE_DIR/k3s-install.sh"
-
-# --- 7. Post-install serveur --------------------------------------------------
-log "Attente du nœud Ready (3 min max)…"
-ready=0
-for _ in $(seq 90); do
-  if "$K3S" kubectl get nodes --no-headers 2>/dev/null | grep -qw Ready; then ready=1; break; fi
-  sleep 2
-done
-[[ $ready -eq 1 ]] || warn "nœud pas encore Ready : journalctl -u k3s -f"
-"$K3S" kubectl get nodes -o wide || true
-
-# kubeconfig pour l'utilisateur qui a lancé sudo
-if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != root ]]; then
-  home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
-  grp="$(id -gn "$SUDO_USER")"
-  install -d -m 0700 -o "$SUDO_USER" -g "$grp" "$home/.kube"
-  install -m 0600 -o "$SUDO_USER" -g "$grp" /etc/rancher/k3s/k3s.yaml "$home/.kube/config"
-  if [[ -f "$home/.bashrc" ]] && ! grep -q 'KUBECONFIG=' "$home/.bashrc"; then
-    # shellcheck disable=SC2016
-    echo 'export KUBECONFIG="$HOME/.kube/config"' >> "$home/.bashrc"
-  fi
-  log "kubeconfig installé pour $SUDO_USER (nouveau terminal, puis : kubectl get nodes)"
-fi
-
-ip_srv="$(hostname -I | awk '{print $1}')"
-echo
-log "Serveur prêt. Pour ajouter un agent :"
-echo "  sudo bash <bundle>/install-k3s-airgap.sh agent \\"
-echo "       --url https://$ip_srv:6443 --token $(cat /var/lib/rancher/k3s/server/node-token)"
-__FIN_FICHIER_02__
-chmod +x 'k3s-airgap/install-k3s-airgap.sh'
-
-ecrire 'k3s-airgap/images.txt' <<'__FIN_FICHIER_03__'
-# Images supplémentaires à embarquer dans le bundle, une par ligne.
-# Nom complet obligatoire (registry/chemin:tag). Les images locales
-# (podman build -t registry.local/monapp:1.0 .) sont prises telles quelles.
-docker.io/library/nginx:alpine
-docker.io/library/oraclelinux:9-slim
-# Image construite localement (podman build -t registry.local/rt-base:9 -f Containerfile.rt-base .)
-registry.local/rt-base:9
-__FIN_FICHIER_03__
-
-ecrire 'k3s-airgap/Containerfile.rt-base' <<'__FIN_FICHIER_04__'
-# Containerfile.rt-base — image de base avec taskset et chrt (util-linux)
-# oraclelinux:9-slim ne garantit pas leur présence : on les ajoute.
-#
-# À construire sur la machine CONNECTÉE, AVANT de lancer telecharger-k3s-airgap.sh :
-#   podman build -t registry.local/rt-base:9 -f Containerfile.rt-base .
-#   podman run --rm registry.local/rt-base:9 sh -c 'command -v taskset chrt'
-FROM docker.io/library/oraclelinux:9-slim
-RUN microdnf install -y util-linux && microdnf clean all
-__FIN_FICHIER_04__
-
-ecrire 'manifests/nginx-deploy.yml' <<'__FIN_FICHIER_05__'
-# nginx-deploy.yml — nginx sur k3s airgap
-# Appliquer :  kubectl apply -f nginx-deploy.yml
-# Tester    :  curl http://<IP_NOEUD>:30080
-# Supprimer :  kubectl delete -f nginx-deploy.yml
----
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: demo
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: nginx
-  namespace: demo
-  labels:
-    app: nginx
-spec:
-  replicas: 2
-  selector:
-    matchLabels:
-      app: nginx
-  template:
-    metadata:
-      labels:
-        app: nginx
-    spec:
-      containers:
-        - name: nginx
-          # Nom EXACT de l'image dans le tarball (vérifier : sudo /usr/local/bin/k3s crictl images)
-          image: docker.io/library/nginx:alpine
-          # Airgap : jamais de pull. Image absente => ErrImageNeverPull immédiat et explicite.
-          imagePullPolicy: Never
-          ports:
-            - name: http
-              containerPort: 80
-          resources:
-            requests:
-              cpu: 50m
-              memory: 32Mi
-            limits:
-              memory: 128Mi
-          readinessProbe:
-            httpGet:
-              path: /
-              port: http
-            initialDelaySeconds: 2
-            periodSeconds: 5
-          livenessProbe:
-            httpGet:
-              path: /
-              port: http
-            initialDelaySeconds: 10
-            periodSeconds: 10
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: nginx
-  namespace: demo
-spec:
-  type: NodePort
-  selector:
-    app: nginx
-  ports:
-    - name: http
-      port: 80
-      targetPort: http
-      nodePort: 30080   # plage autorisée : 30000-32767
-__FIN_FICHIER_05__
-
-ecrire 'manifests/monapp-deploy.yml' <<'__FIN_FICHIER_06__'
-# monapp-deploy.yml — binaire fourni par un dossier de l'hôte, pas embarqué dans l'image
-#
-# Sur le nœud :
-#   sudo mkdir -p /opt/monapp
-#   sudo cp monapp /opt/monapp/monapp.new && sudo chmod 755 /opt/monapp/monapp.new
-#   sudo mv /opt/monapp/monapp.new /opt/monapp/monapp     # remplacement atomique
-#   sudo semanage fcontext -a -t container_file_t '/opt/monapp(/.*)?'   # SELinux
-#   sudo restorecon -Rv /opt/monapp
-#
-# Appliquer        :  kubectl apply -f monapp-deploy.yml
-# Nouveau binaire  :  (cp + mv comme ci-dessus) puis kubectl -n monapp rollout restart deploy/monapp
-# Logs             :  kubectl -n monapp logs -f deploy/monapp
----
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: monapp
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: monapp
-  namespace: monapp
-  labels:
-    app: monapp
-spec:
-  replicas: 1
-  strategy:
-    type: Recreate
-  selector:
-    matchLabels:
-      app: monapp
-  template:
-    metadata:
-      labels:
-        app: monapp
-    spec:
-      # hostPath = dossier local au nœud. Avec plusieurs nœuds, soit le binaire est
-      # copié sur chacun, soit on épingle le pod sur le nœud qui l'a :
-      # nodeSelector:
-      #   kubernetes.io/hostname: <nom-du-noeud>
-      containers:
-        - name: monapp
-          # Image de base seulement : fournit la glibc d'OL9, compatible avec un
-          # binaire compilé sur la VM. Binaire statique (musl) : n'importe quelle image.
-          image: docker.io/library/oraclelinux:9-slim
-          imagePullPolicy: Never
-          # Mode manuel : le conteneur reste en vie sans rien lancer, tu entres dedans
-          # (kubectl -n monapp exec -it deploy/monapp -- bash) et tu lances le binaire toi-même.
-          command: ["sleep", "infinity"]
-          # Mode automatique : le pod lance directement le binaire.
-          # command: ["/opt/monapp/monapp"]
-          # args: ["--config", "/opt/monapp/config.toml"]
-          securityContext:
-            runAsUser: 0
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop: ["ALL"]
-              add: ["SYS_NICE", "IPC_LOCK"]   # pour SCHED_FIFO et mlockall ; retirer si inutile
-          resources:
-            requests:
-              cpu: 100m
-              memory: 64Mi
-            limits:
-              memory: 256Mi
-          volumeMounts:
-            - name: monapp-bin
-              mountPath: /opt/monapp
-              readOnly: true
-      volumes:
-        - name: monapp-bin
-          hostPath:
-            path: /opt/monapp
-            type: Directory     # erreur explicite au démarrage si le dossier n'existe pas
-__FIN_FICHIER_06__
-
-ecrire 'manifests/monapp-pinned-deploy.yml' <<'__FIN_FICHIER_07__'
-# monapp-pinned-deploy.yml — affinité CPU explicite, conteneur par conteneur
-#
-# Plan des cœurs (Xeon W-1290E : 10 cœurs, pas de SMT, 1 nœud NUMA) :
-#   cœurs 0-5 : système, k3s, IRQ ; annexe sur 1-5   non isolés
-#   cœur 6    : rt-a + rt-b (partagé)                ISOLÉ
-#   cœur 7    : rt-c (seul)                          ISOLÉ
-#   cœurs 8-9 : réserve pour de futurs conteneurs RT ISOLÉS (inutilisés pour l'instant)
-#
-# ---- Prérequis nœud -------------------------------------------------------
-# 1. Noyau puis reboot :
-#      grubby --update-kernel=ALL \
-#        --args="isolcpus=managed_irq,domain,6-9 nohz_full=6-9 rcu_nocbs=6-9 irqaffinity=0-5"
-#      cat /sys/devices/system/cpu/isolated          # -> 6-9
-# 2. k3s SANS CPU Manager static (politique par défaut "none") : retirer
-#    cpu-manager-policy / reserved-cpus de /etc/rancher/k3s/config.yaml, puis
-#      sudo systemctl stop k3s && sudo rm -f /var/lib/kubelet/cpu_manager_state \
-#        && sudo systemctl start k3s
-#    (avec "none", chaque conteneur voit tous les cœurs : c'est taskset qui choisit)
-# 3. Image registry.local/rt-base:9 importée (voir Containerfile.rt-base)
-#
-# ---- Vérifier --------------------------------------------------------------
-#   for c in rt-a rt-b rt-c annexe; do echo -n "$c: "
-#     kubectl -n monapp exec deploy/monapp -c $c -- grep Cpus_allowed_list /proc/1/status; done
-#   ps -eLo pid,tid,psr,cls,rtprio,comm | grep -E 'app[1-4]'    # psr = cœur réel
----
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: monapp
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: monapp
-  namespace: monapp
-  labels:
-    app: monapp
-spec:
-  replicas: 1
-  strategy:
-    type: Recreate        # jamais deux instances sur les mêmes cœurs
-  selector:
-    matchLabels:
-      app: monapp
-  template:
-    metadata:
-      labels:
-        app: monapp
-    spec:
-      containers:
-        # --- Cœur 6 (isolé), partagé par rt-a et rt-b ------------------------
-        # Même cœur => règles RT du noyau : rt-a (40) passe toujours avant rt-b (30),
-        # rt-b ne tourne que quand rt-a se bloque. Pour un partage équitable :
-        # même priorité et "chrt -r" (SCHED_RR) pour les deux.
-        - name: rt-a
-          image: registry.local/rt-base:9
-          imagePullPolicy: Never
-          command: ["taskset", "-c", "6", "chrt", "-f", "40", "/opt/monapp/app1"]
-          securityContext: &rt-security
-            runAsUser: 0
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop: ["ALL"]
-              add: ["SYS_NICE", "IPC_LOCK"]
-          resources: &rt-resources
-            # Pas de limits.cpu : le quota CFS n'a pas de sens pour un conteneur
-            # épinglé et peut brider la partie non-RT du process.
-            requests: { cpu: 100m, memory: 128Mi }
-            limits:   { memory: 128Mi }
-          volumeMounts: &bin-mount
-            - name: monapp-bin
-              mountPath: /opt/monapp
-              readOnly: true
-
-        - name: rt-b
-          image: registry.local/rt-base:9
-          imagePullPolicy: Never
-          command: ["taskset", "-c", "6", "chrt", "-f", "30", "/opt/monapp/app2"]
-          securityContext: *rt-security
-          resources: *rt-resources
-          volumeMounts: *bin-mount
-
-        # --- Cœur 7 (isolé), rt-c seul ---------------------------------------
-        - name: rt-c
-          image: registry.local/rt-base:9
-          imagePullPolicy: Never
-          command: ["taskset", "-c", "7", "chrt", "-f", "40", "/opt/monapp/app3"]
-          securityContext: *rt-security
-          resources: *rt-resources
-          volumeMounts: *bin-mount
-
-        # --- Cœurs 1-5 (non isolés), pas de RT -------------------------------
-        - name: annexe
-          image: registry.local/rt-base:9
-          imagePullPolicy: Never
-          # taskset explicite : sans lui, le process resterait en pratique sur 0-5
-          # (le noyau ne répartit jamais vers un cœur isolé), mais ce n'est pas garanti.
-          # Cœur 0 laissé au système (timers, IRQ résiduelles).
-          command: ["taskset", "-c", "1-5", "/opt/monapp/app4"]
-          securityContext:
-            runAsUser: 0
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop: ["ALL"]       # aucun droit RT
-          resources:
-            requests: { cpu: 250m, memory: 64Mi }
-            limits:   { memory: 128Mi }
-          volumeMounts: *bin-mount
-
-      volumes:
-        - name: monapp-bin
-          hostPath:
-            path: /opt/monapp
-            type: Directory
-__FIN_FICHIER_07__
-
-ecrire 'manifests/variantes-cpu-manager/rt-app-deploy.yml' <<'__FIN_FICHIER_08__'
-# rt-app-deploy.yml — application temps réel (SCHED_FIFO) sur k3s
-#
-# Prérequis nœud (/etc/rancher/k3s/config.yaml) pour des cœurs exclusifs :
-#   kubelet-arg:
-#     - "cpu-manager-policy=static"
-#     - "reserved-cpus=0"
-# puis : systemctl stop k3s && rm -f /var/lib/kubelet/cpu_manager_state && systemctl start k3s
-#
-# Appliquer :  kubectl apply -f rt-app-deploy.yml
-# Vérifier  :  ps -eLo pid,tid,cls,rtprio,psr,comm | grep monapp   (cls=FF, psr fixe)
----
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: rt
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: monapp
-  namespace: rt
-  labels:
-    app: monapp
-spec:
-  replicas: 1
-  # Recreate : l'ancien pod libère ses cœurs exclusifs avant que le nouveau démarre.
-  # En RollingUpdate, il faudrait des cœurs libres en plus pendant la transition.
-  strategy:
-    type: Recreate
-  selector:
-    matchLabels:
-      app: monapp
-  template:
-    metadata:
-      labels:
-        app: monapp
-    spec:
-      # nodeSelector:
-      #   kubernetes.io/hostname: <noeud-rt>     # épingler sur le nœud préparé pour le RT
-      securityContext:
-        seccompProfile:
-          type: RuntimeDefault        # autorise sched_setscheduler et mlockall
-      containers:
-        - name: monapp
-          image: registry.local/monapp:1.0
-          imagePullPolicy: Never
-
-          # Option A (recommandée) : l'appli fixe elle-même sa politique et sa priorité
-          # (sched_setscheduler / pthread_setschedparam + mlockall au démarrage).
-          env:
-            - name: RT_PRIORITY
-              value: "40"             # 2-49 : appli classique, OK pour un thread qui calcule.
-                                      # 51-98 : seulement pour un thread périodique qui dort
-                                      # la plupart du temps. Éviter 99 (migration/watchdog).
-          # Option B : priorité imposée de l'extérieur (nécessite chrt dans l'image).
-          # command: ["chrt", "-f", "40", "/usr/local/bin/monapp"]
-
-          securityContext:
-            # Root obligatoire : un UID non-root ne reçoit PAS les capabilities ajoutées
-            # (pas d'ambient caps dans Kubernetes). Alternative non-root :
-            # setcap cap_sys_nice,cap_ipc_lock+ep sur le binaire dans l'image,
-            # runAsNonRoot: true, et allowPrivilegeEscalation: true (sinon no_new_privs
-            # bloque les file capabilities).
-            runAsUser: 0
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities:
-              drop: ["ALL"]
-              add:
-                - SYS_NICE            # SCHED_FIFO / SCHED_RR
-                - IPC_LOCK            # mlockall sans limite RLIMIT_MEMLOCK
-
-          # QoS Guaranteed (requests == limits) + CPU entier => cœurs exclusifs
-          # avec cpu-manager-policy=static. Sans static, le pod tourne mais sans pinning.
-          resources:
-            requests:
-              cpu: "1"
-              memory: 256Mi
-            limits:
-              cpu: "1"
-              memory: 256Mi           # doit couvrir toute la mémoire verrouillée par mlockall
-__FIN_FICHIER_08__
-
-ecrire 'manifests/variantes-cpu-manager/monapp-rt-deploy.yml' <<'__FIN_FICHIER_09__'
-# monapp-rt-deploy.yml — 2 conteneurs, chacun sur son propre cœur isolé exclusif
-#
-# Rien dans ce fichier ne désigne « les cœurs isolés » : c'est la config du nœud
-# qui fait que les cœurs exclusifs ne peuvent venir QUE des cœurs isolés.
-#
-# Prérequis nœud (exemple 4 cœurs : 0-1 système, 2-3 isolés) :
-#   1. noyau : isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3      (grubby + reboot)
-#   2. /etc/rancher/k3s/config.yaml :
-#        kubelet-arg:
-#          - "cpu-manager-policy=static"
-#          - "reserved-cpus=0,1"          # = exactement les cœurs NON isolés
-#   3. systemctl stop k3s && rm -f /var/lib/kubelet/cpu_manager_state && systemctl start k3s
-#
-# Vérifier :
-#   kubectl -n monapp get pod -o jsonpath='{.items[0].status.qosClass}'      -> Guaranteed
-#   kubectl -n monapp exec deploy/monapp -c rt  -- grep Cpus_allowed_list /proc/1/status
-#   kubectl -n monapp exec deploy/monapp -c rt2 -- grep Cpus_allowed_list /proc/1/status
-#   -> l'un sur 2, l'autre sur 3 (k3s choisit lequel, pas toi)
----
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: monapp
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: monapp
-  namespace: monapp
-  labels:
-    app: monapp
-spec:
-  replicas: 1
-  # Recreate obligatoire : les 2 cœurs isolés sont tous pris par ce pod, un
-  # RollingUpdate ne trouverait aucun cœur libre pour le nouveau pod.
-  strategy:
-    type: Recreate
-  selector:
-    matchLabels:
-      app: monapp
-  template:
-    metadata:
-      labels:
-        app: monapp
-    spec:
-      containers:
-        # --- Conteneur RT n°1 : 1 cœur isolé exclusif -------------------------
-        - name: rt
-          image: docker.io/library/oraclelinux:9-slim
-          imagePullPolicy: Never
-          command: ["sleep", "infinity"]          # mode manuel (exec + lancement à la main)
-          # command: ["chrt", "-f", "40", "/opt/monapp/app1"]
-          securityContext:
-            runAsUser: 0
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop: ["ALL"]
-              add: ["SYS_NICE", "IPC_LOCK"]
-          resources:                              # entier + requests == limits
-            requests: { cpu: "1", memory: 256Mi }
-            limits:   { cpu: "1", memory: 256Mi }
-          volumeMounts:
-            - name: monapp-bin
-              mountPath: /opt/monapp
-              readOnly: true
-
-        # --- Conteneur RT n°2 : 1 autre cœur isolé exclusif -------------------
-        - name: rt2
-          image: docker.io/library/oraclelinux:9-slim
-          imagePullPolicy: Never
-          command: ["sleep", "infinity"]
-          # command: ["chrt", "-f", "40", "/opt/monapp/app2"]
-          securityContext:
-            runAsUser: 0
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop: ["ALL"]
-              add: ["SYS_NICE", "IPC_LOCK"]       # à retirer si rt2 ne fait pas de RT
-          resources:
-            requests: { cpu: "1", memory: 128Mi }
-            limits:   { cpu: "1", memory: 128Mi }
-          volumeMounts:
-            - name: monapp-bin
-              mountPath: /opt/monapp
-              readOnly: true
-
-        # --- Exemple de conteneur NON isolé (reste sur 0-1) -------------------
-        # - name: annexe
-        #   image: docker.io/library/oraclelinux:9-slim
-        #   imagePullPolicy: Never
-        #   command: ["sleep", "infinity"]
-        #   resources:                            # fractionnaire => pool partagé
-        #     requests: { cpu: "500m", memory: 64Mi }
-        #     limits:   { cpu: "500m", memory: 64Mi }
-
-      volumes:
-        - name: monapp-bin
-          hostPath:
-            path: /opt/monapp
-            type: Directory
-__FIN_FICHIER_09__
-
-ecrire 'rtlat/Cargo.toml' <<'__FIN_FICHIER_10__'
+ecrire 'Cargo.toml' <<'__FIN_FICHIER_00__'
 [package]
 name = "rtlat"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Vérification de la config temps réel et mesure de latence (timer, ping-pong, interruptions)"
+description = "Vérification de la configuration temps réel et mesure de latence"
+license = "MIT"
 
 [dependencies]
+clap = { version = "4.5", features = ["derive"] }
 libc = "0.2"
 
 [profile.release]
@@ -854,13 +38,121 @@ opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
-debug = false
-__FIN_FICHIER_10__
+strip = true
+__FIN_FICHIER_00__
 
-ecrire 'rtlat/Cargo.lock' <<'__FIN_FICHIER_11__'
+ecrire 'Cargo.lock' <<'__FIN_FICHIER_01__'
 # This file is automatically @generated by Cargo.
 # It is not intended for manual editing.
 version = 4
+
+[[package]]
+name = "anstream"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "824a212faf96e9acacdbd09febd34438f8f711fb84e09a8916013cd7815ca28d"
+dependencies = [
+ "anstyle",
+ "anstyle-parse",
+ "anstyle-query",
+ "anstyle-wincon",
+ "colorchoice",
+ "is_terminal_polyfill",
+ "utf8parse",
+]
+
+[[package]]
+name = "anstyle"
+version = "1.0.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000"
+
+[[package]]
+name = "anstyle-parse"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52ce7f38b242319f7cabaa6813055467063ecdc9d355bbb4ce0c68908cd8130e"
+dependencies = [
+ "utf8parse",
+]
+
+[[package]]
+name = "anstyle-query"
+version = "1.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
+dependencies = [
+ "windows-sys",
+]
+
+[[package]]
+name = "anstyle-wincon"
+version = "3.0.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
+dependencies = [
+ "anstyle",
+ "once_cell_polyfill",
+ "windows-sys",
+]
+
+[[package]]
+name = "clap"
+version = "4.6.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aa8876b300ab35ba921adea3dfd70157a46249b33f95c9084ae5709785478946"
+dependencies = [
+ "clap_builder",
+ "clap_derive",
+]
+
+[[package]]
+name = "clap_builder"
+version = "4.6.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec0797fb7aeb1406c84efac526901f7ec3ead2124f946b494e72879d4b54704d"
+dependencies = [
+ "anstream",
+ "anstyle",
+ "clap_lex",
+ "strsim",
+]
+
+[[package]]
+name = "clap_derive"
+version = "4.6.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9c751b79415d4e559e3d1fcf128e09e720eb673a06d26cf6f392d37d75b66e0"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "clap_lex"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
+
+[[package]]
+name = "colorchoice"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
+
+[[package]]
+name = "heck"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+
+[[package]]
+name = "is_terminal_polyfill"
+version = "1.70.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
 name = "libc"
@@ -869,1615 +161,201 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
-name = "rtlat"
-version = "0.1.0"
+name = "once_cell_polyfill"
+version = "1.70.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
+
+[[package]]
+name = "proc-macro2"
+version = "1.0.107"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
+ "unicode-ident",
+]
+
+[[package]]
+name = "quote"
+version = "1.0.47"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
+dependencies = [
+ "proc-macro2",
+]
+
+[[package]]
+name = "rtlat"
+version = "0.2.0"
+dependencies = [
+ "clap",
  "libc",
 ]
-__FIN_FICHIER_11__
 
-ecrire 'rtlat/src/main.rs' <<'__FIN_FICHIER_12__'
-//! rtlat — vérifie la configuration temps réel et mesure la latence au plus près.
-//!
-//! Modes :
-//!   check     état de la config RT (noyau, isolation, C-states, droits…) + diagnostic
-//!   timer     latence de réveil sur timer périodique (même principe que cyclictest)
-//!   pingpong  aller-retour entre deux threads (pipe, socket unix, ou spin mémoire)
-//!   stall     boucle qui lit l'horloge en continu : chaque « trou » = le cœur a été
-//!             pris par autre chose (IRQ, tick, SMI, bridage RT…)
-//!
-//! Pour chaque mesure : histogramme (10 ns jusqu'à 100 µs, 1 µs jusqu'à 100 ms),
-//! percentiles, pires échantillons datés, défauts de page et préemptions du thread,
-//! et interruptions reçues par le cœur pendant la mesure.
-
-use std::collections::BTreeMap;
-use std::ffi::CStr;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
-use std::os::fd::FromRawFd;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
-use std::thread;
-
-// ============================================================================
-// Temps
-// ============================================================================
-
-#[inline(always)]
-fn now_ns() -> u64 {
-    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
-}
-
-fn sleep_until_ns(t: u64) {
-    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
-    ts.tv_sec = (t / 1_000_000_000) as _;
-    ts.tv_nsec = (t % 1_000_000_000) as _;
-    loop {
-        let r = unsafe {
-            libc::clock_nanosleep(libc::CLOCK_MONOTONIC, libc::TIMER_ABSTIME, &ts, std::ptr::null_mut())
-        };
-        if r != libc::EINTR {
-            break;
-        }
-    }
-}
-
-fn fmt_ns(ns: u64) -> String {
-    if ns >= 1_000_000 {
-        format!("{:.3} ms", ns as f64 / 1e6)
-    } else {
-        format!("{:.2} µs", ns as f64 / 1e3)
-    }
-}
-
-// ============================================================================
-// Ordonnancement, affinité, mémoire
-// ============================================================================
-
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum Policy {
-    Other,
-    Fifo,
-    Rr,
-}
-
-impl Policy {
-    fn parse(s: &str) -> Result<Self, String> {
-        match s {
-            "other" => Ok(Policy::Other),
-            "fifo" => Ok(Policy::Fifo),
-            "rr" => Ok(Policy::Rr),
-            _ => Err(format!("politique inconnue : {s} (fifo, rr, other)")),
-        }
-    }
-    fn raw(self) -> i32 {
-        match self {
-            Policy::Other => libc::SCHED_OTHER,
-            Policy::Fifo => libc::SCHED_FIFO,
-            Policy::Rr => libc::SCHED_RR,
-        }
-    }
-    fn is_rt(self) -> bool {
-        self != Policy::Other
-    }
-}
-
-fn policy_name(raw: i32) -> &'static str {
-    match raw {
-        libc::SCHED_OTHER => "SCHED_OTHER",
-        libc::SCHED_FIFO => "SCHED_FIFO",
-        libc::SCHED_RR => "SCHED_RR",
-        libc::SCHED_BATCH => "SCHED_BATCH",
-        libc::SCHED_IDLE => "SCHED_IDLE",
-        _ => "inconnue",
-    }
-}
-
-#[derive(Clone, Copy)]
-struct ThreadCfg {
-    cpu: Option<usize>,
-    policy: Policy,
-    prio: i32,
-}
-
-fn set_affinity(cpu: usize) -> Result<(), String> {
-    unsafe {
-        let mut set: libc::cpu_set_t = std::mem::zeroed();
-        libc::CPU_ZERO(&mut set);
-        libc::CPU_SET(cpu, &mut set);
-        if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) != 0 {
-            return Err(format!("sched_setaffinity(CPU {cpu}) : {}", io::Error::last_os_error()));
-        }
-    }
-    Ok(())
-}
-
-fn get_affinity() -> Vec<usize> {
-    let mut out = Vec::new();
-    unsafe {
-        let mut set: libc::cpu_set_t = std::mem::zeroed();
-        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) == 0 {
-            for c in 0..libc::CPU_SETSIZE as usize {
-                if libc::CPU_ISSET(c, &set) {
-                    out.push(c);
-                }
-            }
-        }
-    }
-    out
-}
-
-fn set_sched(p: Policy, prio: i32) -> Result<(), String> {
-    let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
-    param.sched_priority = if p.is_rt() { prio } else { 0 };
-    // pid 0 = thread appelant
-    if unsafe { libc::sched_setscheduler(0, p.raw(), &param) } != 0 {
-        return Err(format!(
-            "sched_setscheduler({p:?}, {prio}) : {} (CAP_SYS_NICE manquant ?)",
-            io::Error::last_os_error()
-        ));
-    }
-    Ok(())
-}
-
-fn current_sched() -> (i32, i32) {
-    let pol = unsafe { libc::sched_getscheduler(0) };
-    let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
-    unsafe { libc::sched_getparam(0, &mut param) };
-    (pol, param.sched_priority)
-}
-
-fn current_cpu() -> i32 {
-    unsafe { libc::sched_getcpu() }
-}
-
-fn lock_memory() -> Result<(), String> {
-    if unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) } != 0 {
-        return Err(format!("mlockall : {} (CAP_IPC_LOCK ou ulimit -l ?)", io::Error::last_os_error()));
-    }
-    Ok(())
-}
-
-/// Touche la pile pour qu'aucun défaut de page n'arrive pendant la mesure.
-#[inline(never)]
-fn prefault_stack() {
-    let mut buf = [0u8; 256 * 1024];
-    for i in (0..buf.len()).step_by(4096) {
-        unsafe { std::ptr::write_volatile(&mut buf[i], 1) };
-    }
-    std::hint::black_box(&buf);
-}
-
-/// Ordre important : affinité d'abord (pour ne jamais tourner en RT sur le mauvais cœur).
-fn setup_thread(c: &ThreadCfg) -> Result<(), String> {
-    if let Some(cpu) = c.cpu {
-        set_affinity(cpu)?;
-    }
-    set_sched(c.policy, c.prio)?;
-    prefault_stack();
-    // premiers appels hors mesure (page vDSO de l'horloge, etc.)
-    let _ = (now_ns(), thread_usage(), current_cpu(), get_affinity());
-    Ok(())
-}
-
-#[derive(Default, Clone, Copy)]
-struct Usage {
-    minflt: i64,
-    majflt: i64,
-    nvcsw: i64,
-    nivcsw: i64,
-}
-
-fn thread_usage() -> Usage {
-    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
-    unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut ru) };
-    Usage {
-        minflt: ru.ru_minflt as i64,
-        majflt: ru.ru_majflt as i64,
-        nvcsw: ru.ru_nvcsw as i64,
-        nivcsw: ru.ru_nivcsw as i64,
-    }
-}
-
-// ============================================================================
-// Lecture du système
-// ============================================================================
-
-fn read_trim(path: &str) -> Option<String> {
-    fs::read_to_string(path).ok().map(|s| s.trim().to_string())
-}
-
-fn parse_cpulist(s: &str) -> Vec<usize> {
-    let mut out = Vec::new();
-    for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-        if let Some((a, b)) = part.split_once('-') {
-            if let (Ok(a), Ok(b)) = (a.parse::<usize>(), b.parse::<usize>()) {
-                out.extend(a..=b);
-            }
-        } else if let Ok(v) = part.parse() {
-            out.push(v);
-        }
-    }
-    out
-}
-
-fn status_field(name: &str) -> Option<String> {
-    let txt = fs::read_to_string("/proc/self/status").ok()?;
-    txt.lines()
-        .find(|l| l.starts_with(name))
-        .map(|l| l[name.len()..].trim().to_string())
-}
-
-/// Compteurs d'interruptions d'un CPU : libellé -> (valeur, description)
-type IrqMap = BTreeMap<String, (u64, String)>;
-
-fn irq_snapshot(cpu: usize) -> Option<IrqMap> {
-    let txt = fs::read_to_string("/proc/interrupts").ok()?;
-    let mut lines = txt.lines();
-    let cols: Vec<&str> = lines.next()?.split_whitespace().collect();
-    let idx = cols.iter().position(|c| *c == format!("CPU{cpu}"))?;
-    let ncpu = cols.len();
-    let mut map = IrqMap::new();
-    for l in lines {
-        let mut it = l.split_whitespace();
-        let Some(label) = it.next() else { continue };
-        let rest: Vec<&str> = it.collect();
-        if rest.len() < ncpu || !rest[..ncpu].iter().all(|s| s.parse::<u64>().is_ok()) {
-            continue; // lignes ERR:/MIS: sans colonne par CPU
-        }
-        let v: u64 = rest[idx].parse().unwrap_or(0);
-        map.insert(label.trim_end_matches(':').to_string(), (v, rest[ncpu..].join(" ")));
-    }
-    Some(map)
-}
-
-fn irq_diff(before: &IrqMap, after: &IrqMap) -> Vec<(String, u64, String)> {
-    let mut out: Vec<(String, u64, String)> = after
-        .iter()
-        .filter_map(|(k, (v, d))| {
-            let b = before.get(k).map(|x| x.0).unwrap_or(0);
-            (*v > b).then(|| (k.clone(), v - b, d.clone()))
-        })
-        .collect();
-    out.sort_by_key(|x| std::cmp::Reverse(x.1));
-    out
-}
-
-// ============================================================================
-// Statistiques : histogramme à deux résolutions + pires échantillons
-// ============================================================================
-
-const FINE_LIMIT: u64 = 100_000; // 100 µs, pas de 10 ns
-const FINE_STEP: u64 = 10;
-const COARSE_LIMIT: u64 = 100_000_000; // 100 ms, pas de 1 µs
-const COARSE_STEP: u64 = 1_000;
-const FINE_N: usize = (FINE_LIMIT / FINE_STEP) as usize;
-const COARSE_N: usize = ((COARSE_LIMIT - FINE_LIMIT) / COARSE_STEP) as usize;
-const NBUCKETS: usize = FINE_N + COARSE_N + 1; // dernier = débordement (> 100 ms)
-
-#[inline(always)]
-fn bucket_of(ns: u64) -> usize {
-    if ns < FINE_LIMIT {
-        (ns / FINE_STEP) as usize
-    } else if ns < COARSE_LIMIT {
-        FINE_N + ((ns - FINE_LIMIT) / COARSE_STEP) as usize
-    } else {
-        NBUCKETS - 1
-    }
-}
-
-fn bucket_low(i: usize) -> u64 {
-    if i < FINE_N {
-        i as u64 * FINE_STEP
-    } else if i < NBUCKETS - 1 {
-        FINE_LIMIT + (i - FINE_N) as u64 * COARSE_STEP
-    } else {
-        COARSE_LIMIT
-    }
-}
-
-fn bucket_high(i: usize) -> u64 {
-    if i < FINE_N {
-        (i as u64 + 1) * FINE_STEP
-    } else if i < NBUCKETS - 1 {
-        FINE_LIMIT + (i - FINE_N + 1) as u64 * COARSE_STEP
-    } else {
-        u64::MAX
-    }
-}
-
-#[derive(Clone, Copy)]
-struct Sample {
-    ns: u64,
-    idx: u64,
-    t: u64, // depuis le début de la mesure
-}
-
-struct Stats {
-    hist: Vec<u64>,
-    count: u64,
-    sum: u128,
-    min: u64,
-    max: u64,
-    top: Vec<Sample>, // trié croissant, top[0] = le plus petit des pires
-    top_n: usize,
-    // série temporelle : NWIN fenêtres sur la durée de la mesure
-    win_ns: u64,
-    wcount: Vec<u64>,
-    wsum: Vec<u64>,
-    wmin: Vec<u64>,
-    wmax: Vec<u64>,
-}
-
-const NWIN: usize = 2000;
-
-fn json_str(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
-}
-
-impl Stats {
-    fn new(top_n: usize, duration_ns: u64) -> Self {
-        let mut hist = vec![0u64; NBUCKETS];
-        // calloc renvoie des pages paresseuses : on les touche maintenant
-        for i in (0..hist.len()).step_by(512) {
-            unsafe { std::ptr::write_volatile(&mut hist[i], 0) };
-        }
-        // idem pour le tableau des pires échantillons
-        let mut top = Vec::with_capacity(top_n + 1);
-        top.resize(top_n + 1, Sample { ns: 0, idx: 0, t: 0 });
-        top.clear();
-        Stats {
-            hist,
-            count: 0,
-            sum: 0,
-            min: u64::MAX,
-            max: 0,
-            top,
-            top_n,
-            win_ns: (duration_ns / NWIN as u64).max(1),
-            wcount: vec![0; NWIN],
-            wsum: vec![0; NWIN],
-            wmin: vec![u64::MAX; NWIN],
-            wmax: vec![0; NWIN],
-        }
-    }
-
-    #[inline(always)]
-    fn record(&mut self, ns: u64, idx: u64, t: u64) {
-        self.hist[bucket_of(ns)] += 1;
-        self.count += 1;
-        self.sum += ns as u128;
-        if ns < self.min {
-            self.min = ns;
-        }
-        if ns > self.max {
-            self.max = ns;
-        }
-        let w = ((t / self.win_ns) as usize).min(NWIN - 1);
-        self.wcount[w] += 1;
-        self.wsum[w] += ns;
-        if ns < self.wmin[w] {
-            self.wmin[w] = ns;
-        }
-        if ns > self.wmax[w] {
-            self.wmax[w] = ns;
-        }
-        if self.top.len() < self.top_n {
-            self.top.push(Sample { ns, idx, t });
-            self.top.sort_unstable_by_key(|s| s.ns);
-        } else if self.top_n > 0 && ns > self.top[0].ns {
-            self.top[0] = Sample { ns, idx, t };
-            self.top.sort_unstable_by_key(|s| s.ns);
-        }
-    }
-
-    fn percentile(&self, p: f64) -> u64 {
-        if self.count == 0 {
-            return 0;
-        }
-        let target = ((p * self.count as f64).ceil() as u64).max(1);
-        let mut acc = 0;
-        for (i, &c) in self.hist.iter().enumerate() {
-            acc += c;
-            if acc >= target {
-                return bucket_high(i).min(self.max); // borne haute du seau : estimation prudente
-            }
-        }
-        self.max
-    }
-
-    fn count_at_least(&self, ns: u64) -> u64 {
-        self.hist.iter().enumerate().filter(|(i, _)| bucket_low(*i) >= ns).map(|(_, c)| c).sum()
-    }
-
-    fn write_csv(&self, path: &str) -> io::Result<()> {
-        let mut f = File::create(path)?;
-        writeln!(f, "borne_basse_ns,borne_haute_ns,nombre")?;
-        for (i, &c) in self.hist.iter().enumerate().filter(|(_, c)| **c > 0) {
-            let hi = if i == NBUCKETS - 1 { self.max } else { bucket_high(i) };
-            writeln!(f, "{},{},{}", bucket_low(i), hi, c)?;
-        }
-        Ok(())
-    }
-
-    /// Résultat complet pour rtlat_plot.py
-    fn write_json(&self, path: &str, meta: &[(&str, String)]) -> io::Result<()> {
-        let mut o = String::from("{\n  \"meta\": {");
-        o += &meta.iter().map(|(k, v)| format!("{}: {}", json_str(k), json_str(v))).collect::<Vec<_>>().join(", ");
-        let avg = if self.count > 0 { (self.sum / self.count as u128) as u64 } else { 0 };
-        let min = if self.count > 0 { self.min } else { 0 };
-        o += &format!(
-            "}},\n  \"count\": {}, \"sum_ns\": {}, \"min_ns\": {min}, \"avg_ns\": {avg}, \"max_ns\": {},\n",
-            self.count, self.sum, self.max
-        );
-        let pcts: Vec<String> = [(0.5, "50"), (0.9, "90"), (0.99, "99"), (0.999, "99.9"), (0.9999, "99.99"), (0.99999, "99.999")]
-            .iter()
-            .map(|(p, k)| format!("\"{k}\": {}", self.percentile(*p)))
-            .collect();
-        o += &format!("  \"percentiles\": {{{}}},\n", pcts.join(", "));
-        let hist: Vec<String> = self
-            .hist
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| **c > 0)
-            .map(|(i, c)| {
-                let hi = if i == NBUCKETS - 1 { self.max } else { bucket_high(i) };
-                format!("[{},{},{}]", bucket_low(i), hi, c)
-            })
-            .collect();
-        o += &format!("  \"hist\": [{}],\n", hist.join(","));
-        let wins: Vec<String> = (0..NWIN)
-            .filter(|&w| self.wcount[w] > 0)
-            .map(|w| {
-                format!(
-                    "[{},{},{},{},{}]",
-                    w,
-                    self.wcount[w],
-                    self.wmin[w],
-                    self.wsum[w] / self.wcount[w],
-                    self.wmax[w]
-                )
-            })
-            .collect();
-        o += &format!("  \"window_ns\": {},\n  \"windows\": [{}],\n", self.win_ns, wins.join(","));
-        let top: Vec<String> = self.top.iter().rev().map(|s| format!("[{},{},{}]", s.ns, s.idx, s.t)).collect();
-        o += &format!("  \"top\": [{}]\n}}\n", top.join(","));
-        fs::write(path, o)
-    }
-}
-
-// ============================================================================
-// Configuration en ligne de commande
-// ============================================================================
-
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum Transport {
-    Pipe,
-    Unix,
-    Spin,
-}
-
-struct Cfg {
-    mode: String,
-    cpu: Option<usize>,
-    cpu2: Option<usize>,
-    policy: Option<Policy>,
-    prio: i32,
-    duration_ns: u64,
-    interval_us: u64,
-    transport: Transport,
-    threshold_ns: u64,
-    warmup: Option<u64>,
-    top: usize,
-    dma_latency: Option<i32>,
-    csv: Option<String>,
-    out: Option<String>,
-    mlock: bool,
-    load_cpus: Vec<usize>,
-    load_kind: LoadKind,
-}
-
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum LoadKind {
-    Memcpy,
-    Cpu,
-    Mixed,
-}
-
-impl LoadKind {
-    fn name(self) -> &'static str {
-        match self {
-            LoadKind::Memcpy => "memcpy",
-            LoadKind::Cpu => "cpu",
-            LoadKind::Mixed => "mixed",
-        }
-    }
-}
-
-const USAGE: &str = "\
-rtlat — vérification RT et mesure de latence
-
-USAGE : rtlat <check|timer|pingpong|stall|load> [options]
-
-  check      état de la config temps réel + diagnostic (avec --cpu : détail du cœur)
-  timer      latence de réveil d'un timer périodique (comme cyclictest)
-  pingpong   aller-retour entre deux threads (--transport pipe|unix|spin)
-  stall      détecte chaque interruption du cœur (IRQ, tick, SMI, bridage RT)
-  load       charge parasite seule (--load-cpus, --load-kind, --duration)
-
-OPTIONS
-  --cpu N            cœur du thread mesuré (recommandé)
-  --cpu2 N           cœur du thread écho en pingpong (défaut : --cpu)
-  --policy P         fifo | rr | other   (défaut : fifo ; other pour stall et spin)
-  --prio N           priorité RT 1-99 (défaut : 80)
-  --duration S       durée en secondes (défaut : 10)
-  --interval US      période du timer en µs (défaut : 1000)
-  --transport T      pipe | unix | spin (défaut : unix)
-  --threshold NS     seuil de détection pour stall, en ns (défaut : 1000)
-  --warmup N         premiers échantillons ignorés
-                     (défaut : timer 100, pingpong 1000, stall 0)
-  --top N            nombre de pires échantillons affichés (défaut : 10)
-  --dma-latency US   maintient /dev/cpu_dma_latency pendant la mesure
-                     (0 = interdit les C-states profonds, sur TOUTE la machine)
-  --csv FICHIER      écrit l'histogramme en CSV
-  --out FICHIER      écrit le résultat complet en JSON (pour rtlat_plot.py)
-  --load-cpus LISTE  charge parasite pendant la mesure sur ces cœurs (ex : 0-5)
-  --load-kind K      memcpy (mémoire + cache L3, défaut) | cpu | mixed
-  --no-mlock         ne pas verrouiller la mémoire (pour comparer)
-
-EXEMPLES
-  rtlat check --cpu 7
-  rtlat timer --cpu 7 --prio 80 --interval 1000 --duration 60
-  rtlat pingpong --cpu 7 --cpu2 8 --transport unix --duration 30
-  rtlat stall --cpu 7 --duration 30 --threshold 2000
-  rtlat timer --cpu 7 --duration 3600 --load-cpus 0-5 --out timer-charge.json
-";
-
-fn parse_args() -> Result<Cfg, String> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.is_empty() || args.iter().any(|a| a == "-h" || a == "--help") {
-        print!("{USAGE}");
-        std::process::exit(0);
-    }
-    let mut c = Cfg {
-        mode: args[0].clone(),
-        cpu: None,
-        cpu2: None,
-        policy: None,
-        prio: 80,
-        duration_ns: 10_000_000_000,
-        interval_us: 1000,
-        transport: Transport::Unix,
-        threshold_ns: 1000,
-        warmup: None,
-        top: 10,
-        dma_latency: None,
-        csv: None,
-        out: None,
-        load_cpus: Vec::new(),
-        load_kind: LoadKind::Memcpy,
-        mlock: true,
-    };
-    let mut i = 1;
-    while i < args.len() {
-        let flag = args[i].as_str();
-        if flag == "--no-mlock" {
-            c.mlock = false;
-            i += 1;
-            continue;
-        }
-        let val = args.get(i + 1).ok_or(format!("valeur manquante pour {flag}"))?;
-        let num = |v: &str| v.parse::<u64>().map_err(|_| format!("valeur invalide pour {flag} : {v}"));
-        match flag {
-            "--cpu" => c.cpu = Some(num(val)? as usize),
-            "--cpu2" => c.cpu2 = Some(num(val)? as usize),
-            "--policy" => c.policy = Some(Policy::parse(val)?),
-            "--prio" => c.prio = num(val)? as i32,
-            "--duration" => {
-                let s: f64 = val.parse().map_err(|_| format!("durée invalide : {val}"))?;
-                c.duration_ns = (s * 1e9) as u64;
-            }
-            "--interval" => c.interval_us = num(val)?.max(1),
-            "--transport" => {
-                c.transport = match val.as_str() {
-                    "pipe" => Transport::Pipe,
-                    "unix" => Transport::Unix,
-                    "spin" => Transport::Spin,
-                    _ => return Err(format!("transport inconnu : {val}")),
-                }
-            }
-            "--threshold" => c.threshold_ns = num(val)?,
-            "--warmup" => c.warmup = Some(num(val)?),
-            "--top" => c.top = num(val)? as usize,
-            "--dma-latency" => c.dma_latency = Some(num(val)? as i32),
-            "--csv" => c.csv = Some(val.clone()),
-            "--out" => c.out = Some(val.clone()),
-            "--load-cpus" => {
-                c.load_cpus = parse_cpulist(val);
-                if c.load_cpus.is_empty() {
-                    return Err(format!("liste de CPU invalide : {val}"));
-                }
-            }
-            "--load-kind" => {
-                c.load_kind = match val.as_str() {
-                    "memcpy" => LoadKind::Memcpy,
-                    "cpu" => LoadKind::Cpu,
-                    "mixed" => LoadKind::Mixed,
-                    _ => return Err(format!("type de charge inconnu : {val}")),
-                }
-            }
-            _ => return Err(format!("option inconnue : {flag}")),
-        }
-        i += 2;
-    }
-    if !(1..=99).contains(&c.prio) {
-        return Err("--prio doit être entre 1 et 99".into());
-    }
-    Ok(c)
-}
-
-impl Cfg {
-    fn effective_policy(&self) -> Policy {
-        self.policy.unwrap_or(match (self.mode.as_str(), self.transport) {
-            ("stall", _) | ("pingpong", Transport::Spin) => Policy::Other,
-            _ => Policy::Fifo,
-        })
-    }
-    fn warmup(&self) -> u64 {
-        self.warmup.unwrap_or(match self.mode.as_str() {
-            "timer" => 100,
-            "stall" => 0,
-            _ => 1000,
-        })
-    }
-    fn tcfg(&self, cpu: Option<usize>) -> ThreadCfg {
-        ThreadCfg { cpu, policy: self.effective_policy(), prio: self.prio }
-    }
-}
-
-// ============================================================================
-// Résultat d'une mesure et rapport
-// ============================================================================
-
-struct Measure {
-    st: Stats,
-    u0: Usage,
-    u1: Usage,
-    cpu_start: i32,
-    cpu_end: i32,
-    sched: (i32, i32),
-    affinity: Vec<usize>,
-    extra: Vec<String>,
-}
-
-fn report(cfg: &Cfg, title: &str, m: &Measure, irq: Option<Vec<(String, u64, String)>>) {
-    let st = &m.st;
-    println!("\n=== {title} ===");
-    println!(
-        "thread mesuré : {} prio {} | CPU début/fin : {}/{} | affinité : {:?}",
-        policy_name(m.sched.0),
-        m.sched.1,
-        m.cpu_start,
-        m.cpu_end,
-        m.affinity
-    );
-    if let Some(cpu) = cfg.cpu {
-        let iso = parse_cpulist(&read_trim("/sys/devices/system/cpu/isolated").unwrap_or_default());
-        let nohz = parse_cpulist(&read_trim("/sys/devices/system/cpu/nohz_full").unwrap_or_default());
-        println!(
-            "CPU {cpu} : isolé = {} | nohz_full = {} | mémoire verrouillée = {}",
-            if iso.contains(&cpu) { "oui" } else { "NON" },
-            if nohz.contains(&cpu) { "oui" } else { "non" },
-            if cfg.mlock { "oui" } else { "non" }
-        );
-    }
-    if !cfg.load_cpus.is_empty() {
-        println!("charge parasite : {} sur CPU {:?}", cfg.load_kind.name(), cfg.load_cpus);
-    }
-    for e in &m.extra {
-        println!("{e}");
-    }
-    if st.count == 0 {
-        println!("aucun échantillon enregistré (durée trop courte par rapport à --warmup {} ?)", cfg.warmup());
-        return;
-    }
-    let avg = (st.sum / st.count as u128) as u64;
-    println!("\néchantillons : {} ({} ignorés en échauffement)", st.count, cfg.warmup());
-    println!("min / moy / max : {} / {} / {}", fmt_ns(st.min), fmt_ns(avg), fmt_ns(st.max));
-    println!(
-        "p50 {} | p99 {} | p99.9 {} | p99.99 {} | p99.999 {}",
-        fmt_ns(st.percentile(0.50)),
-        fmt_ns(st.percentile(0.99)),
-        fmt_ns(st.percentile(0.999)),
-        fmt_ns(st.percentile(0.9999)),
-        fmt_ns(st.percentile(0.99999))
-    );
-    print!("au-delà de :");
-    for (thr, label) in [
-        (10_000u64, "10 µs"),
-        (20_000, "20 µs"),
-        (50_000, "50 µs"),
-        (100_000, "100 µs"),
-        (1_000_000, "1 ms"),
-        (10_000_000, "10 ms"),
-    ] {
-        print!("  {label}: {}", st.count_at_least(thr));
-    }
-    println!();
-
-    if !st.top.is_empty() {
-        println!("\npires échantillons :");
-        for (rank, s) in st.top.iter().rev().enumerate() {
-            println!(
-                "  #{:<2} {:>12}   à t = {:>10.3} s   (échantillon n° {})",
-                rank + 1,
-                fmt_ns(s.ns),
-                s.t as f64 / 1e9,
-                s.idx
-            );
-        }
-        // Dans l'ordre chronologique : un écart régulier trahit une cause périodique
-        let mut chrono = st.top.clone();
-        chrono.sort_by_key(|s| s.t);
-        let gaps: Vec<String> =
-            chrono.windows(2).map(|w| format!("{:.3}", (w[1].t - w[0].t) as f64 / 1e9)).collect();
-        if !gaps.is_empty() {
-            println!("  écarts entre eux (ordre chronologique, s) : {}", gaps.join(" "));
-        }
-    }
-
-    let d = |a: i64, b: i64| b - a;
-    let (minf, majf) = (d(m.u0.minflt, m.u1.minflt), d(m.u0.majflt, m.u1.majflt));
-    let (vcs, ivcs) = (d(m.u0.nvcsw, m.u1.nvcsw), d(m.u0.nivcsw, m.u1.nivcsw));
-    println!("\nthread mesuré pendant la mesure :");
-    println!("  défauts de page mineurs / majeurs : {minf} / {majf}");
-    println!("  changements de contexte volontaires / involontaires : {vcs} / {ivcs}");
-
-    if let (Some(cpu), Some(list)) = (cfg.cpu, irq) {
-        println!("\ninterruptions reçues par le CPU {cpu} pendant la mesure :");
-        if list.is_empty() {
-            println!("  aucune");
-        }
-        for (k, n, desc) in list.iter().take(12) {
-            println!("  {k:>6} {n:>10}  {desc}");
-        }
-    }
-
-    // ---- Diagnostic -------------------------------------------------------
-    let mut diag = Vec::new();
-    if m.cpu_start != m.cpu_end {
-        diag.push("le thread a changé de cœur pendant la mesure : affinité non appliquée ?".to_string());
-    }
-    if minf > 0 || majf > 0 {
-        diag.push(format!("{} défaut(s) de page pendant la mesure : mémoire non verrouillée ?", minf + majf));
-    }
-    if ivcs > 0 {
-        diag.push(format!(
-            "thread préempté {ivcs} fois : une tâche plus prioritaire (ou le bridage RT) a pris le cœur"
-        ));
-    }
-    if cfg.effective_policy().is_rt() && st.max >= 10_000_000 {
-        let rt = read_trim("/proc/sys/kernel/sched_rt_runtime_us").unwrap_or_default();
-        if rt != "-1" {
-            diag.push(format!(
-                "pause de {} en RT avec sched_rt_runtime_us = {rt} : signature du bridage RT \
-                 (le cœur a été occupé à 100 % en RT pendant ~1 s)",
-                fmt_ns(st.max)
-            ));
-        }
-    }
-    if !diag.is_empty() {
-        println!("\ndiagnostic :");
-        for d in diag {
-            println!("  - {d}");
-        }
-    }
-
-    if let Some(path) = &cfg.out {
-        let mut u: libc::utsname = unsafe { std::mem::zeroed() };
-        unsafe { libc::uname(&mut u) };
-        let epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let opt = |v: Option<usize>| v.map(|c| c.to_string()).unwrap_or_default();
-        let meta = [
-            ("title", title.to_string()),
-            ("mode", cfg.mode.clone()),
-            ("cpu", opt(cfg.cpu)),
-            ("cpu2", opt(cfg.cpu2.or(cfg.cpu))),
-            ("policy", policy_name(m.sched.0).to_string()),
-            ("prio", m.sched.1.to_string()),
-            ("duration_s", format!("{}", cfg.duration_ns as f64 / 1e9)),
-            ("interval_us", cfg.interval_us.to_string()),
-            ("transport", format!("{:?}", cfg.transport).to_lowercase()),
-            ("threshold_ns", cfg.threshold_ns.to_string()),
-            ("warmup", cfg.warmup().to_string()),
-            ("load", if cfg.load_cpus.is_empty() { "aucune".into() } else { format!("{} sur {:?}", cfg.load_kind.name(), cfg.load_cpus) }),
-            ("kernel", uname_field(&u.release)),
-            ("host", uname_field(&u.nodename)),
-            ("epoch", epoch.to_string()),
-        ];
-        match st.write_json(path, &meta) {
-            Ok(()) => println!("\nrésultat complet écrit dans {path} (tracé : python3 rtlat_plot.py {path})"),
-            Err(e) => eprintln!("écriture JSON impossible ({path}) : {e}"),
-        }
-    }
-    if let Some(path) = &cfg.csv {
-        match st.write_csv(path) {
-            Ok(()) => println!("\nhistogramme écrit dans {path}"),
-            Err(e) => eprintln!("écriture CSV impossible ({path}) : {e}"),
-        }
-    }
-}
-
-fn warn_busy_rt(cfg: &Cfg) {
-    if cfg.effective_policy().is_rt() {
-        let rt = read_trim("/proc/sys/kernel/sched_rt_runtime_us").unwrap_or_default();
-        if rt != "-1" {
-            eprintln!(
-                "attention : boucle active en {:?} avec sched_rt_runtime_us = {rt} : attendez-vous \
-                 à des pauses de quelques dizaines de ms chaque seconde (bridage RT). \
-                 Utilisez --policy other pour mesurer sans ce bridage.",
-                cfg.effective_policy()
-            );
-        }
-    }
-}
-
-// ============================================================================
-// Mode timer
-// ============================================================================
-
-fn run_timer(cfg: &Cfg) -> Result<(), String> {
-    let interval = cfg.interval_us * 1000;
-    let (tc, warmup, dur, top) = (cfg.tcfg(cfg.cpu), cfg.warmup(), cfg.duration_ns, cfg.top);
-    let irq0 = cfg.cpu.and_then(irq_snapshot);
-
-    let h = thread::Builder::new()
-        .name("rtlat-timer".into())
-        .stack_size(4 << 20)
-        .spawn(move || -> Result<Measure, String> {
-            setup_thread(&tc)?;
-            let mut st = Stats::new(top, dur);
-            let (cpu_start, affinity, u0) = (current_cpu(), get_affinity(), thread_usage());
-            let start = now_ns() + interval;
-            let end = start + dur;
-            let (mut next, mut i, mut overruns) = (start, 0u64, 0u64);
-            while next < end {
-                sleep_until_ns(next);
-                let t = now_ns();
-                if i >= warmup {
-                    st.record(t.saturating_sub(next), i, t - start);
-                }
-                i += 1;
-                next += interval;
-                if t >= next {
-                    // on a raté une ou plusieurs périodes
-                    let missed = (t - next) / interval + 1;
-                    overruns += missed;
-                    next += missed * interval;
-                }
-            }
-            let u1 = thread_usage();
-            Ok(Measure {
-                st,
-                u0,
-                u1,
-                cpu_start,
-                cpu_end: current_cpu(),
-                sched: current_sched(),
-                affinity,
-                extra: vec![format!("période : {} µs | périodes ratées : {overruns}", interval / 1000)],
-            })
-        })
-        .map_err(|e| format!("création du thread : {e}"))?;
-
-    let m = h.join().map_err(|_| "le thread de mesure a paniqué".to_string())??;
-    let irq = match (irq0, cfg.cpu.and_then(irq_snapshot)) {
-        (Some(a), Some(b)) => Some(irq_diff(&a, &b)),
-        _ => None,
-    };
-    report(cfg, "latence de réveil du timer (retard sur l'échéance)", &m, irq);
-    Ok(())
-}
-
-// ============================================================================
-// Mode pingpong
-// ============================================================================
-
-#[repr(align(128))] // une ligne de cache (et sa voisine prefetchée) par variable
-struct Line(AtomicU64);
-
-struct SpinShared {
-    ping: Line,
-    pong: Line,
-}
-
-/// (lecture, écriture) pour un côté de l'échange
-type Chan = (File, File);
-
-fn make_channel(t: Transport) -> Result<(Chan, Chan), String> {
-    let err = |what: &str| format!("{what} : {}", io::Error::last_os_error());
-    unsafe {
-        match t {
-            Transport::Pipe => {
-                let (mut a, mut b) = ([0i32; 2], [0i32; 2]);
-                if libc::pipe2(a.as_mut_ptr(), libc::O_CLOEXEC) != 0 || libc::pipe2(b.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
-                    return Err(err("pipe2"));
-                }
-                // côté mesure : écrit dans a, lit dans b ; côté écho : l'inverse
-                Ok((
-                    (File::from_raw_fd(b[0]), File::from_raw_fd(a[1])),
-                    (File::from_raw_fd(a[0]), File::from_raw_fd(b[1])),
-                ))
-            }
-            Transport::Unix => {
-                let mut s = [0i32; 2];
-                if libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0, s.as_mut_ptr()) != 0 {
-                    return Err(err("socketpair"));
-                }
-                let (d0, d1) = (libc::dup(s[0]), libc::dup(s[1]));
-                if d0 < 0 || d1 < 0 {
-                    return Err(err("dup"));
-                }
-                Ok((
-                    (File::from_raw_fd(s[0]), File::from_raw_fd(d0)),
-                    (File::from_raw_fd(s[1]), File::from_raw_fd(d1)),
-                ))
-            }
-            Transport::Spin => unreachable!(),
-        }
-    }
-}
-
-fn run_pingpong(cfg: &Cfg) -> Result<(), String> {
-    let cpu2 = cfg.cpu2.or(cfg.cpu);
-    if cfg.transport == Transport::Spin {
-        match (cfg.cpu, cpu2) {
-            (Some(a), Some(b)) if a != b => {}
-            _ => return Err("--transport spin exige --cpu et --cpu2 différents (attente active)".into()),
-        }
-        warn_busy_rt(cfg);
-    }
-    let (tc_a, tc_b) = (cfg.tcfg(cfg.cpu), cfg.tcfg(cpu2));
-    let (warmup, dur, top, transport) = (cfg.warmup(), cfg.duration_ns, cfg.top, cfg.transport);
-    let barrier = Arc::new(Barrier::new(2));
-    let errors = Arc::new(Mutex::new(Vec::<String>::new()));
-    let spin = Arc::new(SpinShared { ping: Line(AtomicU64::new(0)), pong: Line(AtomicU64::new(0)) });
-    let chans = if transport == Transport::Spin { None } else { Some(make_channel(transport)?) };
-    let (side_a, side_b) = match chans {
-        Some((a, b)) => (Some(a), Some(b)),
-        None => (None, None),
-    };
-    let irq0 = cfg.cpu.and_then(irq_snapshot);
-
-    // ---- thread écho --------------------------------------------------------
-    let (bb, eb, sb) = (barrier.clone(), errors.clone(), spin.clone());
-    let echo = thread::Builder::new()
-        .name("rtlat-echo".into())
-        .stack_size(4 << 20)
-        .spawn(move || {
-            if let Err(e) = setup_thread(&tc_b) {
-                eb.lock().unwrap().push(format!("thread écho : {e}"));
-            }
-            bb.wait();
-            if !eb.lock().unwrap().is_empty() {
-                return;
-            }
-            match side_b {
-                Some((mut rx, mut tx)) => {
-                    let mut buf = [0u8; 8];
-                    loop {
-                        if rx.read_exact(&mut buf).is_err() || u64::from_ne_bytes(buf) == u64::MAX {
-                            return;
-                        }
-                        if tx.write_all(&buf).is_err() {
-                            return;
-                        }
-                    }
-                }
-                None => {
-                    let mut last = 0;
-                    loop {
-                        let v = sb.ping.0.load(Ordering::Acquire);
-                        if v == last {
-                            std::hint::spin_loop();
-                            continue;
-                        }
-                        if v == u64::MAX {
-                            return;
-                        }
-                        sb.pong.0.store(v, Ordering::Release);
-                        last = v;
-                    }
-                }
-            }
-        })
-        .map_err(|e| format!("création du thread écho : {e}"))?;
-
-    // ---- thread de mesure -----------------------------------------------------
-    let (ba, ea, sa) = (barrier.clone(), errors.clone(), spin.clone());
-    let meas = thread::Builder::new()
-        .name("rtlat-ping".into())
-        .stack_size(4 << 20)
-        .spawn(move || -> Result<Measure, String> {
-            let setup = setup_thread(&tc_a);
-            if let Err(e) = &setup {
-                ea.lock().unwrap().push(format!("thread de mesure : {e}"));
-            }
-            let mut st = Stats::new(top, dur);
-            ba.wait();
-            if let Some(e) = ea.lock().unwrap().first() {
-                return Err(e.clone());
-            }
-            let (cpu_start, affinity, u0) = (current_cpu(), get_affinity(), thread_usage());
-            let start = now_ns();
-            let end = start + dur;
-            let mut i = 0u64;
-            match side_a {
-                Some((mut rx, mut tx)) => {
-                    let mut buf = [0u8; 8];
-                    loop {
-                        let t0 = now_ns();
-                        if t0 >= end {
-                            break;
-                        }
-                        tx.write_all(&t0.to_ne_bytes()).map_err(|e| format!("écriture : {e}"))?;
-                        rx.read_exact(&mut buf).map_err(|e| format!("lecture : {e}"))?;
-                        let t1 = now_ns();
-                        if i >= warmup {
-                            st.record(t1 - t0, i, t0 - start);
-                        }
-                        i += 1;
-                    }
-                    let _ = tx.write_all(&u64::MAX.to_ne_bytes());
-                }
-                None => {
-                    loop {
-                        let t0 = now_ns();
-                        if t0 >= end {
-                            break;
-                        }
-                        let seq = i + 1;
-                        sa.ping.0.store(seq, Ordering::Release);
-                        while sa.pong.0.load(Ordering::Acquire) != seq {
-                            std::hint::spin_loop();
-                        }
-                        let t1 = now_ns();
-                        if i >= warmup {
-                            st.record(t1 - t0, i, t0 - start);
-                        }
-                        i += 1;
-                    }
-                    sa.ping.0.store(u64::MAX, Ordering::Release);
-                }
-            }
-            let u1 = thread_usage();
-            Ok(Measure {
-                st,
-                u0,
-                u1,
-                cpu_start,
-                cpu_end: current_cpu(),
-                sched: current_sched(),
-                affinity,
-                extra: vec![format!(
-                    "transport : {transport:?} | thread écho sur CPU {} | aller simple ≈ aller-retour / 2",
-                    tc_b.cpu.map(|c| c.to_string()).unwrap_or("libre".into())
-                )],
-            })
-        })
-        .map_err(|e| format!("création du thread de mesure : {e}"))?;
-
-    let res = meas.join().map_err(|_| "le thread de mesure a paniqué".to_string())?;
-    if res.is_err() {
-        // débloque l'écho s'il attend encore
-        spin.ping.0.store(u64::MAX, Ordering::Release);
-    }
-    let _ = echo.join();
-    let m = res?;
-    let irq = match (irq0, cfg.cpu.and_then(irq_snapshot)) {
-        (Some(a), Some(b)) => Some(irq_diff(&a, &b)),
-        _ => None,
-    };
-    report(cfg, "aller-retour entre deux threads", &m, irq);
-    Ok(())
-}
-
-// ============================================================================
-// Mode stall
-// ============================================================================
-
-fn run_stall(cfg: &Cfg) -> Result<(), String> {
-    warn_busy_rt(cfg);
-    let (tc, warmup, dur, top, thr) = (cfg.tcfg(cfg.cpu), cfg.warmup(), cfg.duration_ns, cfg.top, cfg.threshold_ns);
-    let irq0 = cfg.cpu.and_then(irq_snapshot);
-
-    let h = thread::Builder::new()
-        .name("rtlat-stall".into())
-        .stack_size(4 << 20)
-        .spawn(move || -> Result<Measure, String> {
-            setup_thread(&tc)?;
-            let mut st = Stats::new(top, dur);
-            let (cpu_start, affinity, u0) = (current_cpu(), get_affinity(), thread_usage());
-            let start = now_ns();
-            let end = start + dur;
-            let (mut prev, mut iters) = (start, 0u64);
-            loop {
-                let t = now_ns();
-                let gap = t - prev;
-                if gap > thr && iters >= warmup {
-                    st.record(gap, iters, t - start);
-                }
-                prev = t;
-                iters += 1;
-                if iters & 1023 == 0 && t >= end {
-                    break;
-                }
-            }
-            let elapsed = prev - start;
-            let u1 = thread_usage();
-            Ok(Measure {
-                cpu_end: current_cpu(),
-                sched: current_sched(),
-                extra: vec![
-                    format!(
-                        "seuil : {} | itérations : {iters} | lecture d'horloge : {:.1} ns en moyenne",
-                        fmt_ns(thr),
-                        elapsed as f64 / iters as f64
-                    ),
-                    format!(
-                        "temps volé au thread : {} sur {:.3} s ({:.4} %)",
-                        fmt_ns(st.sum as u64),
-                        elapsed as f64 / 1e9,
-                        st.sum as f64 / elapsed as f64 * 100.0
-                    ),
-                ],
-                st,
-                u0,
-                u1,
-                cpu_start,
-                affinity,
-            })
-        })
-        .map_err(|e| format!("création du thread : {e}"))?;
-
-    let m = h.join().map_err(|_| "le thread de mesure a paniqué".to_string())??;
-    let irq = match (irq0, cfg.cpu.and_then(irq_snapshot)) {
-        (Some(a), Some(b)) => Some(irq_diff(&a, &b)),
-        _ => None,
-    };
-    report(cfg, "interruptions du thread (durée de chaque trou)", &m, irq);
-    Ok(())
-}
-
-// ============================================================================
-// Mode check
-// ============================================================================
-
-fn uname_field(f: &[libc::c_char]) -> String {
-    unsafe { CStr::from_ptr(f.as_ptr()) }.to_string_lossy().into_owned()
-}
-
-fn rlimit_str(res: i32) -> String {
-    let mut r: libc::rlimit = unsafe { std::mem::zeroed() };
-    if unsafe { libc::getrlimit(res as _, &mut r) } != 0 {
-        return "?".into();
-    }
-    let f = |v: libc::rlim_t| if v == libc::RLIM_INFINITY { "illimité".to_string() } else { v.to_string() };
-    format!("{} (max {})", f(r.rlim_cur), f(r.rlim_max))
-}
-
-fn run_check(cfg: &Cfg) -> Result<(), String> {
-    let mut warn: Vec<String> = Vec::new();
-    let get = |p: &str| read_trim(p).unwrap_or_else(|| "absent".into());
-
-    println!("=== Système ===");
-    let mut u: libc::utsname = unsafe { std::mem::zeroed() };
-    unsafe { libc::uname(&mut u) };
-    let version = uname_field(&u.version);
-    println!("noyau            : {} {}", uname_field(&u.release), version);
-    let preempt_rt = std::path::Path::new("/sys/kernel/realtime").exists() || version.contains("PREEMPT_RT");
-    println!("PREEMPT_RT       : {}", if preempt_rt { "oui" } else { "non (noyau standard)" });
-    println!("ligne de commande: {}", get("/proc/cmdline"));
-    let isolated = get("/sys/devices/system/cpu/isolated");
-    let nohz = get("/sys/devices/system/cpu/nohz_full");
-    println!("cœurs isolés     : {}", if isolated.is_empty() { "aucun" } else { &isolated });
-    println!("nohz_full        : {}", if nohz.is_empty() || nohz == "(null)" { "aucun" } else { &nohz });
-    let rt_runtime = get("/proc/sys/kernel/sched_rt_runtime_us");
-    println!(
-        "bridage RT       : sched_rt_runtime_us = {rt_runtime} / sched_rt_period_us = {}",
-        get("/proc/sys/kernel/sched_rt_period_us")
-    );
-    let thp = get("/sys/kernel/mm/transparent_hugepage/enabled");
-    println!("THP              : {thp}");
-    if thp.contains("[always]") {
-        warn.push("THP en mode always : compactage mémoire possible pendant un défaut de page (pics de latence)".into());
-    }
-    if rt_runtime != "-1" && rt_runtime != "absent" {
-        warn.push(format!(
-            "bridage RT actif ({rt_runtime} µs/s) : une tâche RT à 100 % sera suspendue jusqu'à ~50 ms par seconde"
-        ));
-    }
-
-    println!("\n=== Ce process ===");
-    println!("CPU autorisés    : {}", status_field("Cpus_allowed_list:").unwrap_or("?".into()));
-    let capeff = status_field("CapEff:").unwrap_or_default();
-    let caps = u64::from_str_radix(&capeff, 16).unwrap_or(0);
-    let has = |bit: u32| caps & (1u64 << bit) != 0;
-    println!(
-        "capabilities     : CapEff={capeff} | SYS_NICE={} IPC_LOCK={} SYS_ADMIN={}",
-        if has(23) { "oui" } else { "non" },
-        if has(14) { "oui" } else { "non" },
-        if has(21) { "oui" } else { "non" }
-    );
-    println!("RLIMIT_RTPRIO    : {}", rlimit_str(libc::RLIMIT_RTPRIO as i32));
-    println!("RLIMIT_MEMLOCK   : {}", rlimit_str(libc::RLIMIT_MEMLOCK as i32));
-    let cg = fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
-    println!("cgroup           : {}", cg.lines().next().unwrap_or("?"));
-    if !has(23) {
-        warn.push("pas de CAP_SYS_NICE : impossible de passer en SCHED_FIFO/RR".into());
-    }
-
-    if let Some(cpu) = cfg.cpu {
-        println!("\n=== CPU {cpu} ===");
-        let base = format!("/sys/devices/system/cpu/cpu{cpu}");
-        let iso = parse_cpulist(&isolated);
-        if !iso.contains(&cpu) {
-            warn.push(format!("CPU {cpu} n'est pas isolé (isolcpus)"));
-        }
-        if !parse_cpulist(&nohz).contains(&cpu) {
-            warn.push(format!("CPU {cpu} n'est pas en nohz_full : le tick noyau continue"));
-        }
-        let gov = get(&format!("{base}/cpufreq/scaling_governor"));
-        println!(
-            "fréquence        : gouverneur {gov} | actuelle {} kHz | min {} | max {}",
-            get(&format!("{base}/cpufreq/scaling_cur_freq")),
-            get(&format!("{base}/cpufreq/scaling_min_freq")),
-            get(&format!("{base}/cpufreq/scaling_max_freq"))
-        );
-        if gov != "performance" && gov != "absent" {
-            warn.push(format!("gouverneur CPU {cpu} = {gov} : la fréquence varie (cpupower frequency-set -g performance)"));
-        }
-        println!("pilote cpuidle   : {}", get("/sys/devices/system/cpu/cpuidle/current_driver"));
-        println!("états de veille  :");
-        let mut deep_enabled = Vec::new();
-        for s in 0..16 {
-            let p = format!("{base}/cpuidle/state{s}");
-            let Some(name) = read_trim(&format!("{p}/name")) else { break };
-            let lat: u64 = read_trim(&format!("{p}/latency")).and_then(|v| v.parse().ok()).unwrap_or(0);
-            let dis = read_trim(&format!("{p}/disable")).unwrap_or_default();
-            let usage = read_trim(&format!("{p}/usage")).unwrap_or_default();
-            println!(
-                "  state{s:<2} {name:<10} sortie {lat:>4} µs  {}  utilisé {usage} fois",
-                if dis == "1" { "désactivé" } else { "actif    " }
-            );
-            if dis != "1" && lat > 10 {
-                deep_enabled.push(format!("{name} ({lat} µs)"));
-            }
-        }
-        if !deep_enabled.is_empty() {
-            warn.push(format!(
-                "états de veille lents actifs sur CPU {cpu} : {} (cpupower -c {cpu} idle-set -D 10)",
-                deep_enabled.join(", ")
-            ));
-        }
-        if let Some(irq) = irq_snapshot(cpu) {
-            let mut v: Vec<_> = irq.iter().filter(|(_, (n, _))| *n > 0).collect();
-            v.sort_by_key(|x| std::cmp::Reverse(x.1 .0));
-            println!("interruptions cumulées depuis le boot (top 8) :");
-            for (k, (n, d)) in v.iter().take(8) {
-                println!("  {k:>6} {n:>12}  {d}");
-            }
-        }
-    }
-
-    println!("\n=== Tests ===");
-    match lock_memory() {
-        Ok(()) => println!("mlockall         : OK"),
-        Err(e) => {
-            println!("mlockall         : ÉCHEC — {e}");
-            warn.push("mlockall impossible : défauts de page possibles pendant l'exécution RT".into());
-        }
-    }
-    if let Some(cpu) = cfg.cpu {
-        match set_affinity(cpu) {
-            Ok(()) => println!("affinité CPU {cpu}   : OK (exécution sur CPU {})", current_cpu()),
-            Err(e) => {
-                println!("affinité CPU {cpu}   : ÉCHEC — {e}");
-                warn.push(format!("impossible de s'épingler sur CPU {cpu} (cpuset du conteneur ?)"));
-            }
-        }
-    }
-    match set_sched(Policy::Fifo, cfg.prio) {
-        Ok(()) => {
-            let (p, pr) = current_sched();
-            println!("SCHED_FIFO {:<5} : OK ({} {pr})", cfg.prio, policy_name(p));
-            let _ = set_sched(Policy::Other, 0);
-        }
-        Err(e) => {
-            println!("SCHED_FIFO {:<5} : ÉCHEC — {e}", cfg.prio);
-            warn.push("passage en SCHED_FIFO refusé".into());
-        }
-    }
-
-    println!("\n=== Diagnostic ===");
-    if warn.is_empty() {
-        println!("rien à signaler");
-    }
-    for w in warn {
-        println!("  - {w}");
-    }
-    Ok(())
-}
-
-// ============================================================================
-// Charge parasite (« voisin bruyant »)
-// ============================================================================
-
-fn run_load(cfg: &Cfg) -> Result<(), String> {
-    if cfg.load_cpus.is_empty() {
-        return Err("le mode load exige --load-cpus".into());
-    }
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut handles = Vec::new();
-    for (n, &cpu) in cfg.load_cpus.iter().enumerate() {
-        let stop = stop.clone();
-        let kind = match cfg.load_kind {
-            LoadKind::Mixed if n % 2 == 1 => LoadKind::Cpu,
-            LoadKind::Mixed => LoadKind::Memcpy,
-            k => k,
-        };
-        handles.push(thread::spawn(move || {
-            if let Err(e) = set_affinity(cpu) {
-                eprintln!("charge : {e}");
-                return;
-            }
-            match kind {
-                LoadKind::Memcpy => {
-                    // 2 × 32 Mo : bien plus que le L3, on sature cache et bande passante mémoire
-                    let mut a = vec![1u8; 32 << 20];
-                    let mut b = vec![2u8; 32 << 20];
-                    while !stop.load(Ordering::Relaxed) {
-                        b.copy_from_slice(&a);
-                        std::mem::swap(&mut a, &mut b);
-                        std::hint::black_box(&b);
-                    }
-                }
-                _ => {
-                    let mut x = 1u64;
-                    while !stop.load(Ordering::Relaxed) {
-                        for _ in 0..1_000_000 {
-                            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                        }
-                        std::hint::black_box(x);
-                    }
-                }
-            }
-        }));
-    }
-    eprintln!("charge {} sur CPU {:?} pendant {:.0} s", cfg.load_kind.name(), cfg.load_cpus, cfg.duration_ns as f64 / 1e9);
-    thread::sleep(std::time::Duration::from_nanos(cfg.duration_ns));
-    stop.store(true, Ordering::Relaxed);
-    for h in handles {
-        let _ = h.join();
-    }
-    Ok(())
-}
-
-/// Lance la charge dans un process séparé (sa mémoire n'est pas verrouillée par mlockall).
-/// posix_spawn plutôt que std::process::Command : ce dernier fait dépendre le binaire
-/// de symboles glibc récents (2.39), alors qu'OL9 a la glibc 2.34.
-fn spawn_load(cfg: &Cfg) -> Option<libc::pid_t> {
-    if cfg.load_cpus.is_empty() || cfg.mode == "load" || cfg.mode == "check" {
-        return None;
-    }
-    if let Some(cpu) = cfg.cpu {
-        if cfg.load_cpus.contains(&cpu) {
-            eprintln!("attention : la charge tourne aussi sur le CPU mesuré ({cpu})");
-        }
-    }
-    extern "C" {
-        static environ: *const *mut libc::c_char;
-    }
-    let exe = std::env::current_exe().ok()?.into_os_string().into_string().ok()?;
-    let list = cfg.load_cpus.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(",");
-    let secs = format!("{}", cfg.duration_ns as f64 / 1e9 + 10.0);
-    let args = [exe.as_str(), "load", "--load-cpus", &list, "--load-kind", cfg.load_kind.name(), "--duration", &secs];
-    let cargs: Vec<std::ffi::CString> = args.iter().map(|a| std::ffi::CString::new(*a).unwrap()).collect();
-    let mut argv: Vec<*mut libc::c_char> = cargs.iter().map(|c| c.as_ptr() as *mut libc::c_char).collect();
-    argv.push(std::ptr::null_mut());
-    let mut pid: libc::pid_t = 0;
-    let r = unsafe {
-        libc::posix_spawn(&mut pid, cargs[0].as_ptr(), std::ptr::null(), std::ptr::null(), argv.as_ptr(), environ)
-    };
-    if r != 0 {
-        eprintln!("attention : impossible de lancer la charge : {}", io::Error::from_raw_os_error(r));
-        return None;
-    }
-    thread::sleep(std::time::Duration::from_secs(1)); // laisse la charge monter
-    Some(pid)
-}
-
-fn stop_load(pid: libc::pid_t) {
-    unsafe {
-        libc::kill(pid, libc::SIGTERM);
-        libc::waitpid(pid, std::ptr::null_mut(), 0);
-    }
-}
-
-// ============================================================================
-
-fn main() {
-    let cfg = match parse_args() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("erreur : {e}\n\n{USAGE}");
-            std::process::exit(2);
-        }
-    };
-
-    // Gardé ouvert jusqu'à la fin : la contrainte cesse à la fermeture du fichier.
-    let _dma = match cfg.dma_latency {
-        Some(us) => match OpenOptions::new().write(true).open("/dev/cpu_dma_latency") {
-            Ok(mut f) => {
-                let _ = f.write_all(&us.to_ne_bytes());
-                eprintln!("/dev/cpu_dma_latency = {us} µs pendant la mesure (toute la machine)");
-                Some(f)
-            }
-            Err(e) => {
-                eprintln!("erreur : /dev/cpu_dma_latency : {e}");
-                std::process::exit(1);
-            }
-        },
-        None => None,
-    };
-
-    if cfg.mlock && cfg.mode != "check" && cfg.mode != "load" {
-        if let Err(e) = lock_memory() {
-            eprintln!("attention : {e}");
-        }
-    }
-
-    let child = spawn_load(&cfg);
-    let res = match cfg.mode.as_str() {
-        "check" => run_check(&cfg),
-        "timer" => run_timer(&cfg),
-        "pingpong" => run_pingpong(&cfg),
-        "stall" => run_stall(&cfg),
-        "load" => run_load(&cfg),
-        m => Err(format!("mode inconnu : {m}\n\n{USAGE}")),
-    };
-    if let Some(pid) = child {
-        stop_load(pid);
-    }
-    if let Err(e) = res {
-        eprintln!("erreur : {e}");
-        std::process::exit(1);
-    }
-}
-__FIN_FICHIER_12__
-
-ecrire 'rtlat/README.md' <<'__FIN_FICHIER_13__'
+[[package]]
+name = "strsim"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
+
+[[package]]
+name = "syn"
+version = "3.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d78c8dee4c7bf0e14673097256fed6142ce9d3b85a408189d07482442145823b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
+name = "unicode-ident"
+version = "1.0.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
+
+[[package]]
+name = "utf8parse"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
+
+[[package]]
+name = "windows-link"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
+
+[[package]]
+name = "windows-sys"
+version = "0.61.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
+dependencies = [
+ "windows-link",
+]
+__FIN_FICHIER_01__
+
+ecrire 'README.md' <<'__FIN_FICHIER_02__'
 # rtlat — vérification temps réel et mesure de latence
 
-Un seul binaire, une seule dépendance (`libc`), plus un script de tracé Python. Cinq modes :
+Outil en ligne de commande (Rust, clap) qui vérifie qu'une machine est bien configurée
+pour le temps réel, puis mesure sa latence. Un script Python trace les résultats.
 
-| Mode | Ce qu'il mesure | Politique par défaut |
+| Sous-commande | Ce qu'elle mesure | Politique par défaut |
 |---|---|---|
-| `check` | config RT : noyau, isolcpus, nohz_full, bridage RT, THP, C-states, fréquence, droits, + tests | — |
+| `check` | config RT : noyau, isolcpus, nohz_full, bridage RT, THP, C-states, fréquence, droits ; puis teste mlockall, l'épinglage et SCHED_FIFO | — |
 | `timer` | retard de réveil d'un timer périodique (principe de `cyclictest`) | FIFO 80 |
 | `pingpong` | aller-retour entre deux threads : `unix` (≈ ZeroMQ ipc), `pipe`, `spin` (mémoire partagée) | FIFO 80, `other` pour `spin` |
-| `stall` | chaque « trou » pendant lequel le cœur a été pris (IRQ, tick, SMI, bridage RT) | `other` |
-| `load` | charge parasite seule (memcpy / cpu), aussi intégrable à une mesure via `--load-cpus` | — |
+| `stall` | chaque « trou » pendant lequel le cœur est pris au thread (IRQ, tick, SMI, bridage RT) | `other` |
+| `load` | charge parasite seule (`--cpus`, `--kind`, `--duration`) | — |
 
-Chaque mesure affiche : min/moy/max, p50 → p99.999, nombre d'échantillons au-delà de
+Chaque mesure affiche min/moy/max, p50 → p99.999, le nombre d'échantillons au-delà de
 10 µs … 10 ms, les pires échantillons **datés** (et l'écart entre eux, pour repérer une
-cause périodique), les défauts de page et préemptions du thread, les interruptions
-reçues par le cœur pendant la mesure, et un diagnostic.
+cause périodique), les défauts de page et préemptions du thread, les interruptions reçues
+par le cœur pendant la mesure, puis un diagnostic.
+
+## Organisation du code
+
+```
+src/
+  main.rs          point d'entrée, dispatch, environnement commun des mesures
+  cli.rs           ligne de commande (clap) : sous-commandes, options, analyse des durées
+  modes/
+    check.rs       sous-commande check
+    timer.rs       sous-commande timer
+    pingpong.rs    sous-commande pingpong (unix, pipe, spin)
+    stall.rs       sous-commande stall
+  load.rs          charge parasite + lancement dans un process séparé
+  sched.rs         affinité, politique d'ordonnancement, mlockall, getrusage
+  system.rs        /proc et /sys : cœurs isolés, C-states, interruptions, limites
+  stats.rs         histogramme (10 ns → 100 µs, 1 µs → 100 ms), percentiles, série temporelle
+  report.rs        rapport terminal et diagnostic
+  export.rs        JSON (pour rtlat_plot.py) et CSV
+  clock.rs         horloge monotone, formatage des durées
+  ui.rs            mise en forme (couleurs si terminal, désactivables avec NO_COLOR)
+rtlat_plot.py      tracés matplotlib
+```
 
 ## Compiler
 
 ```bash
-cargo build --release                 # binaire : target/release/rtlat
+cargo build --release          # binaire : target/release/rtlat
+cargo test                     # tests unitaires
 ```
 
-Le binaire glibc demande au plus GLIBC 2.34 : il tourne sur OL9 et dans `oraclelinux:9-slim`.
+Le binaire demande au plus la glibc 2.34 : il tourne sur OL9 et dans `oraclelinux:9-slim`.
+Pour un binaire statique : `cargo build --release --target x86_64-unknown-linux-musl`.
 
-Pour un binaire statique qui tourne dans n'importe quelle image :
+**En airgap** : clap amène des dépendances. Sur la machine connectée :
 ```bash
-rustup target add x86_64-unknown-linux-musl
-cargo build --release --target x86_64-unknown-linux-musl
+mkdir -p .cargo && cargo vendor > .cargo/config.toml
 ```
+puis transférer le dossier entier (avec `vendor/`) ; `cargo build --release --offline`.
 
-En airgap, sur la machine connectée : `cargo vendor` puis suivre les instructions
-affichées (bloc à copier dans `.cargo/config.toml`), et transférer le dossier entier.
-
-## Utilisation conseillée (dans l'ordre)
+## Utilisation conseillée
 
 ```bash
-# 1. La config est-elle bonne ?
-rtlat check --cpu 7
-
-# 2. La plateforme seule : latence de réveil sur le cœur RT
-rtlat timer --cpu 7 --prio 80 --interval 1000 --duration 300
-
-# 3. Qui vole du temps au cœur ? (SCHED_OTHER : pas de bridage RT)
-rtlat stall --cpu 7 --duration 60 --threshold 2000
-
-# 4. Communication entre threads, comme tes applis
-rtlat pingpong --cpu 7 --cpu2 8 --transport unix --duration 60   # deux cœurs
-rtlat pingpong --cpu 7 --transport unix --duration 60            # même cœur
-rtlat pingpong --cpu 7 --cpu2 8 --transport spin --duration 30   # plancher matériel
+rtlat check --cpu 7                                               # 1. la config est-elle bonne ?
+rtlat timer --cpu 7 --interval 1000 --duration 1h --out repos.json # 2. latence de la plateforme
+rtlat timer --cpu 7 --duration 1h --load-cpus 0-5 --out charge.json  #    … sous charge
+rtlat stall --cpu 7 --duration 1m --threshold 2000                # 3. qui vole du temps au cœur ?
+rtlat pingpong --cpu 7 --cpu2 8 --transport unix --duration 1m    # 4. communication entre threads
+python3 rtlat_plot.py repos.json charge.json --labels repos,charge --deadline 50
 ```
 
-Options utiles : `--dma-latency 0` (interdit les C-states profonds pendant la mesure,
-sur toute la machine, pour comparer), `--no-mlock` (pour voir l'effet du verrouillage
-mémoire), `--csv histo.csv` (histogramme pour tracer).
+Durées : `90`, `90s`, `500ms`, `10m`, `2h`. Aide complète : `rtlat --help`, `rtlat timer --help`.
 
-Droits nécessaires : `CAP_SYS_NICE` (RT), `CAP_IPC_LOCK` (mlockall), root pour
-`--dma-latency`. Dans le pod : les capabilities du manifest suffisent.
+Options utiles : `--dma-latency 0` (interdit les C-states profonds pendant la mesure, sur
+toute la machine, pour comparer), `--no-mlock` (effet du verrouillage mémoire),
+`--csv histo.csv`, `--out resultat.json`.
 
-## Mesurer comme les références (méthodologie)
+Droits : `CAP_SYS_NICE` (temps réel), `CAP_IPC_LOCK` (mlockall), root pour `--dma-latency`.
 
-Ce que font OSADL, Canonical, Intel ECI et le wiki RT de la Linux Foundation :
+## Méthodologie (ce que font OSADL, Canonical, Intel ECI, le wiki RT Linux Foundation)
 
 1. **Sous charge représentative** : une mesure au repos sous-estime le pire cas.
-   `--load-cpus 0-5 --load-kind memcpy` lance un « voisin bruyant » qui sature le cache L3
-   partagé et la bande passante mémoire sur les cœurs non isolés (ou `stress-ng` si disponible).
+   `--load-cpus 0-5 --load-kind memcpy` sature le cache L3 partagé et la bande passante
+   mémoire depuis les cœurs non isolés (ou `stress-ng` si disponible).
 2. **Longtemps** : les événements rares ne sortent qu'en heures (Intel ECI : 24 h par
    configuration). 10 s sert à valider, pas à qualifier.
 3. **Histogramme en échelle log**, max affiché, une configuration par courbe.
-4. **Comparer en ne changeant qu'un réglage à la fois** (C-states, nohz_full, priorité…).
+4. **Un seul réglage changé à la fois** (C-states, nohz_full, priorité…).
 
-```bash
-rtlat timer --cpu 7 --duration 3600 --out repos.json
-rtlat timer --cpu 7 --duration 3600 --load-cpus 0-5 --out charge.json
-python3 rtlat_plot.py repos.json charge.json --labels "repos,charge" --deadline 50
-```
-
-Outils de référence complémentaires (paquets à embarquer en airgap) :
-`cyclictest` / `hwlatdetect` (rt-tests) pour des chiffres comparables aux publications,
-`rtla timerlat` / `rtla osnoise` (outils du noyau) pour trouver la **cause** d'un pic :
-`rtla timerlat top -a 50` arrête la trace au premier dépassement de 50 µs et dit qui
+Outils de référence complémentaires : `cyclictest` / `hwlatdetect` (rt-tests) pour des
+chiffres comparables aux publications ; `rtla timerlat top -a 50` (outils du noyau) pour
+trouver la **cause** d'un pic : il s'arrête au premier dépassement de 50 µs et dit qui
 (IRQ, thread, softirq) a retardé le réveil.
 
 ## Tracés
 
-`rtlat_plot.py` (matplotlib) lit un ou plusieurs JSON `--out` et produit une figure :
+`rtlat_plot.py` (matplotlib) lit un ou plusieurs JSON `--out` :
 
 - **répartition des latences**, axe Y log (style OSADL). `--gauss` superpose une gaussienne
-  ajustée sur le cœur : une distribution de latence n'est **jamais** gaussienne — bornée à
-  gauche par le minimum matériel, souvent multimodale, avec une longue queue à droite ;
-- **latence par percentile** (style HdrHistogram) : lecture directe de p99, p99.99… et du max ;
+  ajustée sur le cœur : une latence n'est **jamais** gaussienne — bornée à gauche par le
+  minimum matériel, souvent à plusieurs bosses, avec une longue queue à droite ;
+- **latence par percentile** (style HdrHistogram) : p99, p99.99… et le maximum ;
 - **évolution dans le temps** (max et moyenne par fenêtre) : un pic régulier = une cause
   périodique (ex. bridage RT toutes les 1,000 s).
 
-Options : `-o fig.png|svg|pdf`, `--labels`, `--deadline US` (budget + nombre de
-dépassements), `--logx` (toute la plage, pics compris), `--xmax US`.
-À lancer sur n'importe quelle machine avec Python 3 + matplotlib : le JSON est petit.
+Options : `-o fig.png|svg|pdf`, `--labels`, `--deadline US`, `--logx`, `--xmax US`.
 
 ## Lire les résultats
 
 | Symptôme | Cause probable |
 |---|---|
-| pires échantillons espacés de **1,000 s**, 30-50 ms chacun, en RT | bridage RT (`sched_rt_runtime_us`) : le cœur est à 100 % en RT |
-| `LOC` élevé dans les interruptions du cœur | le tick noyau tourne : `nohz_full` absent, ou plus d'une tâche sur le cœur |
-| `CAL` / `TLB` | appels inter-cœurs / invalidations TLB causés par d'autres process (munmap, mprotect…) |
+| pires échantillons espacés de **1,000 s**, 30-50 ms chacun, en RT | bridage RT (`sched_rt_runtime_us`) : cœur à 100 % en RT |
+| `LOC` élevé dans les IRQ du cœur | le tick noyau tourne : `nohz_full` absent, ou plus d'une tâche sur le cœur |
+| `CAL` / `TLB` | appels inter-cœurs / invalidations TLB venant d'autres process |
 | `RES` | réveils inter-cœurs (rescheduling IPI) |
-| trous de 50-200 µs sans aucune interruption visible | SMI (BIOS) — invisibles pour l'OS |
+| trous de 50-200 µs sans aucune IRQ visible | SMI (BIOS), invisibles pour l'OS |
 | défauts de page > 0 | mémoire non verrouillée, ou allocations pendant la boucle |
-| préemptions involontaires > 0 | une tâche plus prioritaire, ou le bridage RT, a pris le cœur |
+| préemptions involontaires > 0 | tâche plus prioritaire, ou bridage RT |
 | `timer` : max qui baisse avec `--dma-latency 0` | C-states profonds en cause |
+__FIN_FICHIER_02__
 
-Note : le mode `stall` en `--policy fifo` reproduit volontairement le bridage RT
-(boucle active à 100 %) — utile pour le voir, à éviter pour mesurer le reste.
-__FIN_FICHIER_13__
-
-ecrire 'rtlat/rtlat_plot.py' <<'__FIN_FICHIER_14__'
+ecrire 'rtlat_plot.py' <<'__FIN_FICHIER_03__'
 #!/usr/bin/env python3
 """rtlat_plot.py — tracés de latence à partir des JSON produits par `rtlat ... --out`.
 
@@ -2751,8 +629,2294 @@ def main():
 
 if __name__ == "__main__":
     main()
-__FIN_FICHIER_14__
-chmod +x 'rtlat/rtlat_plot.py'
+__FIN_FICHIER_03__
 
-echo
-echo "Kit créé. Étapes suivantes : voir $(pwd)/LISEZMOI.md"
+ecrire 'src/main.rs' <<'__FIN_FICHIER_04__'
+//! rtlat — vérifie la configuration temps réel d'une machine et mesure la latence.
+//!
+//! Organisation :
+//! - [`cli`]     : ligne de commande (clap)
+//! - [`modes`]   : une sous-commande par fichier (check, timer, pingpong, stall)
+//! - [`load`]    : charge parasite (« voisin bruyant »)
+//! - [`sched`]   : affinité, politique d'ordonnancement, mémoire du thread
+//! - [`system`]  : lecture de /proc et /sys, interruptions, C-states
+//! - [`stats`]   : histogramme, percentiles, pires échantillons, série temporelle
+//! - [`report`]  : rapport terminal et diagnostic ; [`export`] : JSON / CSV
+//! - [`clock`], [`ui`] : horloge et mise en forme
+
+mod cli;
+mod clock;
+mod export;
+mod load;
+mod modes;
+mod report;
+mod sched;
+mod stats;
+mod system;
+mod ui;
+
+use std::process::ExitCode;
+
+use clap::Parser;
+
+use cli::{Cli, Command, MeasureArgs};
+
+/// Les erreurs sont des messages destinés à l'utilisateur.
+pub type Result<T> = std::result::Result<T, String>;
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    match run(cli.command) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{} {e}", ui::red("erreur :"));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run(command: Command) -> Result<()> {
+    match command {
+        Command::Check(args) => modes::check::run(&args),
+        Command::Load(args) => load::run(&args),
+        Command::Timer(args) => with_measure_env(&args.common, || modes::timer::run(&args)),
+        Command::Pingpong(args) => with_measure_env(&args.common, || modes::pingpong::run(&args)),
+        Command::Stall(args) => with_measure_env(&args.common, || modes::stall::run(&args)),
+    }
+}
+
+/// Prépare l'environnement commun à toutes les mesures, puis le défait à la fin
+/// (les gardes sont libérées dans l'ordre inverse quand la fonction se termine).
+fn with_measure_env(common: &MeasureArgs, measure: impl FnOnce() -> Result<()>) -> Result<()> {
+    let _dma_guard = system::DmaLatency::hold(common.dma_latency)?;
+    if !common.no_mlock {
+        if let Err(e) = sched::lock_memory() {
+            ui::warn(&e);
+        }
+    }
+    let _load_guard = load::LoadChild::spawn(&common.load, common.cpu, common.duration);
+    measure()
+}
+__FIN_FICHIER_04__
+
+ecrire 'src/cli.rs' <<'__FIN_FICHIER_05__'
+//! Ligne de commande.
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use clap::{Args, Parser, Subcommand, ValueEnum};
+
+use crate::sched::Policy;
+use crate::system::parse_cpulist;
+
+const EXAMPLES: &str = "\
+Exemples :
+  rtlat check --cpu 7
+  rtlat timer --cpu 7 --prio 80 --interval 1000 --duration 1h --out timer.json
+  rtlat timer --cpu 7 --duration 1h --load-cpus 0-5 --out timer-charge.json
+  rtlat pingpong --cpu 7 --cpu2 8 --transport unix --duration 1m
+  rtlat stall --cpu 7 --duration 1m --threshold 2000
+  python3 rtlat_plot.py timer.json timer-charge.json --labels repos,charge";
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "rtlat",
+    version,
+    about = "Vérification de la configuration temps réel et mesure de latence",
+    after_help = EXAMPLES
+)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Command {
+    /// État de la configuration temps réel, tests de droits et diagnostic
+    Check(CheckArgs),
+    /// Retard de réveil d'un timer périodique (même principe que cyclictest)
+    Timer(TimerArgs),
+    /// Aller-retour entre deux threads (socket unix, pipe ou mémoire partagée)
+    Pingpong(PingpongArgs),
+    /// Détecte chaque moment où le cœur est pris au thread (IRQ, tick, SMI, bridage RT)
+    Stall(StallArgs),
+    /// Charge parasite seule (« voisin bruyant »), sans mesure
+    Load(LoadArgs),
+}
+
+// ---------------------------------------------------------------------------
+// check
+// ---------------------------------------------------------------------------
+
+#[derive(Args, Debug)]
+pub struct CheckArgs {
+    /// Cœur à inspecter en détail (C-states, fréquence, interruptions)
+    #[arg(long)]
+    pub cpu: Option<usize>,
+
+    /// Priorité utilisée pour tester le passage en SCHED_FIFO
+    #[arg(long, default_value_t = 80, value_parser = clap::value_parser!(i32).range(1..=99))]
+    pub prio: i32,
+}
+
+// ---------------------------------------------------------------------------
+// Options communes aux mesures
+// ---------------------------------------------------------------------------
+
+#[derive(Args, Debug, Clone)]
+pub struct MeasureArgs {
+    /// Cœur du thread mesuré (recommandé)
+    #[arg(long)]
+    pub cpu: Option<usize>,
+
+    /// Politique d'ordonnancement [défaut : fifo ; other pour stall et pingpong spin]
+    #[arg(long, value_enum)]
+    pub policy: Option<Policy>,
+
+    /// Priorité temps réel
+    #[arg(long, default_value_t = 80, value_parser = clap::value_parser!(i32).range(1..=99))]
+    pub prio: i32,
+
+    /// Durée de la mesure : 30, 30s, 10m, 2h, 500ms
+    #[arg(long, default_value = "10s", value_parser = parse_duration)]
+    pub duration: Duration,
+
+    /// Premiers échantillons ignorés [défaut : timer 100, pingpong 1000, stall 0]
+    #[arg(long)]
+    pub warmup: Option<u64>,
+
+    /// Nombre de pires échantillons affichés
+    #[arg(long, default_value_t = 10)]
+    pub top: usize,
+
+    /// Maintient /dev/cpu_dma_latency pendant la mesure (0 = pas de C-state profond, toute la machine)
+    #[arg(long, value_name = "US")]
+    pub dma_latency: Option<i32>,
+
+    /// Écrit l'histogramme en CSV
+    #[arg(long, value_name = "FICHIER")]
+    pub csv: Option<PathBuf>,
+
+    /// Écrit le résultat complet en JSON (pour rtlat_plot.py)
+    #[arg(long, value_name = "FICHIER")]
+    pub out: Option<PathBuf>,
+
+    /// Ne pas verrouiller la mémoire (pour comparer)
+    #[arg(long)]
+    pub no_mlock: bool,
+
+    #[command(flatten)]
+    pub load: LoadOpts,
+}
+
+/// Charge parasite lancée pendant une mesure.
+#[derive(Args, Debug, Clone)]
+pub struct LoadOpts {
+    /// Cœurs qui reçoivent la charge pendant la mesure (ex : 0-5)
+    #[arg(long = "load-cpus", value_name = "LISTE", value_parser = parse_cpus)]
+    pub cpus: Option<CpuList>,
+
+    /// Type de charge
+    #[arg(long = "load-kind", value_enum, default_value_t = LoadKind::Memcpy)]
+    pub kind: LoadKind,
+}
+
+// ---------------------------------------------------------------------------
+// Sous-commandes de mesure
+// ---------------------------------------------------------------------------
+
+#[derive(Args, Debug)]
+pub struct TimerArgs {
+    #[command(flatten)]
+    pub common: MeasureArgs,
+
+    /// Période du timer
+    #[arg(long, value_name = "US", default_value_t = 1000, value_parser = clap::value_parser!(u64).range(1..))]
+    pub interval: u64,
+}
+
+#[derive(Args, Debug)]
+pub struct PingpongArgs {
+    #[command(flatten)]
+    pub common: MeasureArgs,
+
+    /// Cœur du thread écho [défaut : --cpu]
+    #[arg(long)]
+    pub cpu2: Option<usize>,
+
+    /// Canal entre les deux threads
+    #[arg(long, value_enum, default_value_t = Transport::Unix)]
+    pub transport: Transport,
+}
+
+#[derive(Args, Debug)]
+pub struct StallArgs {
+    #[command(flatten)]
+    pub common: MeasureArgs,
+
+    /// Durée minimale d'un « trou » pour être compté
+    #[arg(long, value_name = "NS", default_value_t = 1000)]
+    pub threshold: u64,
+}
+
+#[derive(Args, Debug)]
+pub struct LoadArgs {
+    /// Cœurs à charger (ex : 0-5)
+    #[arg(long, value_name = "LISTE", value_parser = parse_cpus)]
+    pub cpus: CpuList,
+
+    /// Type de charge
+    #[arg(long, value_enum, default_value_t = LoadKind::Memcpy)]
+    pub kind: LoadKind,
+
+    /// Durée : 30, 30s, 10m, 2h
+    #[arg(long, default_value = "10s", value_parser = parse_duration)]
+    pub duration: Duration,
+}
+
+// ---------------------------------------------------------------------------
+// Types de valeurs
+// ---------------------------------------------------------------------------
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Transport {
+    /// socketpair AF_UNIX (proche de ZeroMQ ipc://)
+    Unix,
+    /// deux pipes
+    Pipe,
+    /// mémoire partagée en attente active : plancher matériel (cœurs distincts)
+    Spin,
+}
+
+impl Transport {
+    pub fn name(self) -> &'static str {
+        match self {
+            Transport::Unix => "unix",
+            Transport::Pipe => "pipe",
+            Transport::Spin => "spin",
+        }
+    }
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoadKind {
+    /// copies de 32 Mo : sature le cache L3 partagé et la bande passante mémoire
+    Memcpy,
+    /// calcul pur dans les registres
+    Cpu,
+    /// moitié memcpy, moitié cpu
+    Mixed,
+}
+
+impl LoadKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            LoadKind::Memcpy => "memcpy",
+            LoadKind::Cpu => "cpu",
+            LoadKind::Mixed => "mixed",
+        }
+    }
+}
+
+/// Liste de cœurs au format noyau : « 0-5 », « 1,3,6-7 ».
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CpuList(pub Vec<usize>);
+
+impl CpuList {
+    pub fn to_arg(&self) -> String {
+        self.0.iter().map(usize::to_string).collect::<Vec<_>>().join(",")
+    }
+}
+
+fn parse_cpus(s: &str) -> Result<CpuList, String> {
+    let cpus = parse_cpulist(s);
+    if cpus.is_empty() {
+        Err(format!("liste de cœurs invalide : « {s} » (ex : 0-5 ou 1,3,6-7)"))
+    } else {
+        Ok(CpuList(cpus))
+    }
+}
+
+/// « 90 » (secondes), « 90s », « 500ms », « 10m », « 2h », décimales acceptées.
+pub fn parse_duration(s: &str) -> Result<Duration, String> {
+    let s = s.trim();
+    let split = s.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(s.len());
+    let (num, unit) = s.split_at(split);
+    let value: f64 = num.trim().parse().map_err(|_| format!("durée invalide : « {s} »"))?;
+    let factor = match unit {
+        "" | "s" => 1.0,
+        "ms" => 1e-3,
+        "m" | "min" => 60.0,
+        "h" => 3600.0,
+        _ => return Err(format!("unité de durée inconnue : « {unit} » (ms, s, m, h)")),
+    };
+    if value.is_nan() || value <= 0.0 {
+        return Err("la durée doit être positive".into());
+    }
+    Ok(Duration::from_secs_f64(value * factor))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durations() {
+        assert_eq!(parse_duration("90").unwrap(), Duration::from_secs(90));
+        assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
+        assert_eq!(parse_duration("1.5m").unwrap(), Duration::from_secs(90));
+        assert_eq!(parse_duration("2h").unwrap(), Duration::from_secs(7200));
+        assert!(parse_duration("3d").is_err());
+        assert!(parse_duration("0").is_err());
+    }
+
+    #[test]
+    fn cli_is_consistent() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
+}
+__FIN_FICHIER_05__
+
+ecrire 'src/clock.rs' <<'__FIN_FICHIER_06__'
+//! Horloge monotone et formatage des durées.
+
+/// Temps monotone en nanosecondes (lecture vDSO, quelques dizaines de ns).
+#[inline(always)]
+pub fn now_ns() -> u64 {
+    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+/// Dort jusqu'à l'instant absolu `deadline_ns` (CLOCK_MONOTONIC, TIMER_ABSTIME).
+/// L'échéance absolue évite que les retards s'accumulent d'une période à l'autre.
+pub fn sleep_until_ns(deadline_ns: u64) {
+    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+    ts.tv_sec = (deadline_ns / 1_000_000_000) as _;
+    ts.tv_nsec = (deadline_ns % 1_000_000_000) as _;
+    loop {
+        let r = unsafe {
+            libc::clock_nanosleep(libc::CLOCK_MONOTONIC, libc::TIMER_ABSTIME, &ts, std::ptr::null_mut())
+        };
+        if r != libc::EINTR {
+            return;
+        }
+    }
+}
+
+/// 1234 → « 1.23 µs », 2 500 000 → « 2.500 ms ».
+pub fn fmt_ns(ns: u64) -> String {
+    if ns >= 1_000_000 {
+        format!("{:.3} ms", ns as f64 / 1e6)
+    } else {
+        format!("{:.2} µs", ns as f64 / 1e3)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn format() {
+        assert_eq!(super::fmt_ns(1234), "1.23 µs");
+        assert_eq!(super::fmt_ns(2_500_000), "2.500 ms");
+    }
+}
+__FIN_FICHIER_06__
+
+ecrire 'src/ui.rs' <<'__FIN_FICHIER_07__'
+//! Mise en forme de la sortie terminal. Couleurs seulement si la sortie est un
+//! terminal et que NO_COLOR n'est pas défini.
+
+use std::fmt::Display;
+use std::sync::OnceLock;
+
+const WIDTH: usize = 72;
+const LABEL_WIDTH: usize = 18;
+
+fn colors_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| unsafe { libc::isatty(1) == 1 } && std::env::var_os("NO_COLOR").is_none())
+}
+
+fn paint(code: &str, s: &str) -> String {
+    if colors_enabled() {
+        format!("\x1b[{code}m{s}\x1b[0m")
+    } else {
+        s.to_string()
+    }
+}
+
+pub fn bold(s: &str) -> String {
+    paint("1", s)
+}
+pub fn dim(s: &str) -> String {
+    paint("2", s)
+}
+pub fn red(s: &str) -> String {
+    paint("31", s)
+}
+pub fn green(s: &str) -> String {
+    paint("32", s)
+}
+pub fn yellow(s: &str) -> String {
+    paint("33", s)
+}
+
+/// `━━ Titre ━━━━━━━━━━━━━`
+pub fn section(title: &str) {
+    let fill = WIDTH.saturating_sub(title.chars().count() + 4);
+    println!("\n{}", bold(&format!("━━ {title} {}", "━".repeat(fill))));
+}
+
+/// Ligne « libellé  valeur » alignée.
+pub fn row(label: &str, value: impl Display) {
+    println!("  {} {value}", dim(&format!("{label:<LABEL_WIDTH$}")));
+}
+
+/// Ligne de diagnostic.
+pub fn finding(ok: bool, text: &str) {
+    if ok {
+        println!("  {} {text}", green("✓"));
+    } else {
+        println!("  {} {text}", yellow("⚠"));
+    }
+}
+
+/// Avertissement sur la sortie d'erreur.
+pub fn warn(text: &str) {
+    eprintln!("{} {text}", yellow("attention :"));
+}
+
+/// Oui / NON coloré.
+pub fn yes_no(v: bool) -> String {
+    if v {
+        green("oui")
+    } else {
+        red("non")
+    }
+}
+
+/// 1234567 → « 1 234 567 ».
+#[allow(clippy::manual_is_multiple_of)] // is_multiple_of exige Rust ≥ 1.87
+pub fn count(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(' ');
+        }
+        out.push(c);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn grouping() {
+        assert_eq!(super::count(0), "0");
+        assert_eq!(super::count(999), "999");
+        assert_eq!(super::count(1234567), "1 234 567");
+    }
+}
+__FIN_FICHIER_07__
+
+ecrire 'src/sched.rs' <<'__FIN_FICHIER_08__'
+//! Ordonnancement, affinité CPU et mémoire du thread courant.
+
+use std::io;
+use std::thread::{self, JoinHandle};
+
+use clap::ValueEnum;
+
+use crate::clock::now_ns;
+use crate::Result;
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Policy {
+    /// SCHED_FIFO : temps réel, garde le cœur jusqu'à se bloquer
+    Fifo,
+    /// SCHED_RR : temps réel, tranches de temps entre tâches de même priorité
+    Rr,
+    /// SCHED_OTHER : ordonnancement normal (CFS/EEVDF)
+    Other,
+}
+
+impl Policy {
+    fn raw(self) -> i32 {
+        match self {
+            Policy::Fifo => libc::SCHED_FIFO,
+            Policy::Rr => libc::SCHED_RR,
+            Policy::Other => libc::SCHED_OTHER,
+        }
+    }
+
+    pub fn is_realtime(self) -> bool {
+        self != Policy::Other
+    }
+}
+
+pub fn policy_name(raw: i32) -> &'static str {
+    match raw {
+        libc::SCHED_OTHER => "SCHED_OTHER",
+        libc::SCHED_FIFO => "SCHED_FIFO",
+        libc::SCHED_RR => "SCHED_RR",
+        libc::SCHED_BATCH => "SCHED_BATCH",
+        libc::SCHED_IDLE => "SCHED_IDLE",
+        _ => "inconnue",
+    }
+}
+
+/// Ce qu'on applique à un thread de mesure.
+#[derive(Clone, Copy, Debug)]
+pub struct ThreadCfg {
+    pub cpu: Option<usize>,
+    pub policy: Policy,
+    pub prio: i32,
+}
+
+impl ThreadCfg {
+    /// Applique la configuration au thread courant.
+    ///
+    /// L'affinité passe en premier : le thread ne doit jamais tourner en temps réel
+    /// sur un autre cœur que celui prévu, même un instant.
+    pub fn apply(&self) -> Result<()> {
+        if let Some(cpu) = self.cpu {
+            set_affinity(cpu)?;
+        }
+        set_scheduler(self.policy, self.prio)?;
+        prefault_stack();
+        // premiers appels faits ici, hors mesure (page vDSO de l'horloge, etc.)
+        let _ = (now_ns(), Usage::of_thread(), current_cpu(), affinity());
+        Ok(())
+    }
+}
+
+/// Lance `body` dans un thread configuré selon `cfg` et attend son résultat.
+pub fn run_in_thread<T, F>(name: &str, cfg: ThreadCfg, body: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    let handle: JoinHandle<Result<T>> = thread::Builder::new()
+        .name(name.into())
+        .stack_size(4 << 20)
+        .spawn(move || {
+            cfg.apply()?;
+            body()
+        })
+        .map_err(|e| format!("création du thread {name} : {e}"))?;
+    handle.join().map_err(|_| format!("le thread {name} a paniqué"))?
+}
+
+pub fn set_affinity(cpu: usize) -> Result<()> {
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_SET(cpu, &mut set);
+        if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) != 0 {
+            return Err(format!("épinglage sur le CPU {cpu} : {}", io::Error::last_os_error()));
+        }
+    }
+    Ok(())
+}
+
+pub fn affinity() -> Vec<usize> {
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
+            return Vec::new();
+        }
+        (0..libc::CPU_SETSIZE as usize).filter(|&c| libc::CPU_ISSET(c, &set)).collect()
+    }
+}
+
+pub fn set_scheduler(policy: Policy, prio: i32) -> Result<()> {
+    let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
+    param.sched_priority = if policy.is_realtime() { prio } else { 0 };
+    // pid 0 = thread appelant
+    if unsafe { libc::sched_setscheduler(0, policy.raw(), &param) } != 0 {
+        return Err(format!(
+            "passage en {policy:?} {prio} : {} (CAP_SYS_NICE manquant ?)",
+            io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+/// (politique brute, priorité) du thread appelant.
+pub fn scheduler() -> (i32, i32) {
+    let policy = unsafe { libc::sched_getscheduler(0) };
+    let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
+    unsafe { libc::sched_getparam(0, &mut param) };
+    (policy, param.sched_priority)
+}
+
+pub fn current_cpu() -> i32 {
+    unsafe { libc::sched_getcpu() }
+}
+
+/// Verrouille toute la mémoire du process, présente et future : plus aucun défaut
+/// de page pendant les mesures.
+pub fn lock_memory() -> Result<()> {
+    if unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) } != 0 {
+        return Err(format!(
+            "mlockall : {} (CAP_IPC_LOCK manquant ou ulimit -l trop bas ?)",
+            io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+/// Touche la pile pour qu'elle soit déjà en mémoire au moment de la mesure.
+#[inline(never)]
+fn prefault_stack() {
+    let mut buf = [0u8; 256 * 1024];
+    for i in (0..buf.len()).step_by(4096) {
+        unsafe { std::ptr::write_volatile(&mut buf[i], 1) };
+    }
+    std::hint::black_box(&buf);
+}
+
+/// Compteurs getrusage du thread appelant.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Usage {
+    pub minor_faults: i64,
+    pub major_faults: i64,
+    pub voluntary_switches: i64,
+    pub involuntary_switches: i64,
+}
+
+impl Usage {
+    pub fn of_thread() -> Self {
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut ru) };
+        Usage {
+            minor_faults: ru.ru_minflt as i64,
+            major_faults: ru.ru_majflt as i64,
+            voluntary_switches: ru.ru_nvcsw as i64,
+            involuntary_switches: ru.ru_nivcsw as i64,
+        }
+    }
+
+    /// Différence entre deux relevés.
+    pub fn since(self, before: Usage) -> Usage {
+        Usage {
+            minor_faults: self.minor_faults - before.minor_faults,
+            major_faults: self.major_faults - before.major_faults,
+            voluntary_switches: self.voluntary_switches - before.voluntary_switches,
+            involuntary_switches: self.involuntary_switches - before.involuntary_switches,
+        }
+    }
+}
+__FIN_FICHIER_08__
+
+ecrire 'src/system.rs' <<'__FIN_FICHIER_09__'
+//! Lecture de l'état du système : /proc, /sys, interruptions, limites.
+
+use std::collections::BTreeMap;
+use std::ffi::CStr;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+
+use crate::Result;
+
+pub fn read_trim(path: &str) -> Option<String> {
+    fs::read_to_string(path).ok().map(|s| s.trim().to_string())
+}
+
+/// « 0-3,6,8-9 » → [0, 1, 2, 3, 6, 8, 9]
+pub fn parse_cpulist(s: &str) -> Vec<usize> {
+    let mut cpus = Vec::new();
+    for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        match part.split_once('-') {
+            Some((a, b)) => {
+                if let (Ok(a), Ok(b)) = (a.parse::<usize>(), b.parse::<usize>()) {
+                    cpus.extend(a..=b);
+                }
+            }
+            None => cpus.extend(part.parse::<usize>()),
+        }
+    }
+    cpus
+}
+
+pub fn isolated_cpus() -> Vec<usize> {
+    parse_cpulist(&read_trim("/sys/devices/system/cpu/isolated").unwrap_or_default())
+}
+
+pub fn nohz_full_cpus() -> Vec<usize> {
+    parse_cpulist(&read_trim("/sys/devices/system/cpu/nohz_full").unwrap_or_default())
+}
+
+/// Valeur de sched_rt_runtime_us (« -1 » = bridage RT désactivé).
+pub fn rt_runtime_us() -> String {
+    read_trim("/proc/sys/kernel/sched_rt_runtime_us").unwrap_or_else(|| "?".into())
+}
+
+pub fn rt_throttling_enabled() -> bool {
+    let v = rt_runtime_us();
+    v != "-1" && v != "?"
+}
+
+/// Champ de /proc/self/status (« Cpus_allowed_list: », « CapEff: »…).
+pub fn status_field(name: &str) -> Option<String> {
+    let text = fs::read_to_string("/proc/self/status").ok()?;
+    text.lines().find_map(|l| l.strip_prefix(name)).map(|v| v.trim().to_string())
+}
+
+pub struct Uname {
+    pub release: String,
+    pub version: String,
+    pub nodename: String,
+}
+
+pub fn uname() -> Uname {
+    let mut u: libc::utsname = unsafe { std::mem::zeroed() };
+    unsafe { libc::uname(&mut u) };
+    let field = |f: &[libc::c_char]| unsafe { CStr::from_ptr(f.as_ptr()) }.to_string_lossy().into_owned();
+    Uname { release: field(&u.release), version: field(&u.version), nodename: field(&u.nodename) }
+}
+
+/// Limite de ressource lisible : « 0 (max 0) », « illimité (max illimité) ».
+pub fn rlimit(resource: i32) -> String {
+    let mut r: libc::rlimit = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrlimit(resource as _, &mut r) } != 0 {
+        return "?".into();
+    }
+    let show = |v: libc::rlim_t| if v == libc::RLIM_INFINITY { "illimité".to_string() } else { v.to_string() };
+    format!("{} (max {})", show(r.rlim_cur), show(r.rlim_max))
+}
+
+// ---------------------------------------------------------------------------
+// États de veille (C-states)
+// ---------------------------------------------------------------------------
+
+pub struct IdleState {
+    pub index: usize,
+    pub name: String,
+    pub exit_latency_us: u64,
+    pub disabled: bool,
+    pub usage: u64,
+}
+
+pub fn idle_states(cpu: usize) -> Vec<IdleState> {
+    (0..32)
+        .map_while(|i| {
+            let base = format!("/sys/devices/system/cpu/cpu{cpu}/cpuidle/state{i}");
+            let name = read_trim(&format!("{base}/name"))?;
+            let num = |f: &str| read_trim(&format!("{base}/{f}")).and_then(|v| v.parse().ok()).unwrap_or(0);
+            Some(IdleState {
+                index: i,
+                name,
+                exit_latency_us: num("latency"),
+                disabled: num("disable") == 1,
+                usage: num("usage"),
+            })
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Interruptions (/proc/interrupts)
+// ---------------------------------------------------------------------------
+
+/// Compteurs d'un CPU : libellé → (valeur, description).
+pub type IrqCounts = BTreeMap<String, (u64, String)>;
+
+pub fn irq_counts(cpu: usize) -> Option<IrqCounts> {
+    let text = fs::read_to_string("/proc/interrupts").ok()?;
+    let mut lines = text.lines();
+    let columns: Vec<&str> = lines.next()?.split_whitespace().collect();
+    let col = columns.iter().position(|c| *c == format!("CPU{cpu}"))?;
+    let ncpu = columns.len();
+    let mut counts = IrqCounts::new();
+    for line in lines {
+        let mut fields = line.split_whitespace();
+        let Some(label) = fields.next() else { continue };
+        let rest: Vec<&str> = fields.collect();
+        // les lignes ERR:/MIS: n'ont qu'une valeur globale
+        if rest.len() < ncpu || !rest[..ncpu].iter().all(|v| v.parse::<u64>().is_ok()) {
+            continue;
+        }
+        let value = rest[col].parse().unwrap_or(0);
+        counts.insert(label.trim_end_matches(':').to_string(), (value, rest[ncpu..].join(" ")));
+    }
+    Some(counts)
+}
+
+pub struct IrqDelta {
+    pub name: String,
+    pub count: u64,
+    pub description: String,
+}
+
+/// Relève les interruptions d'un cœur au début et à la fin d'une mesure.
+pub struct IrqWatch {
+    cpu: Option<usize>,
+    before: Option<IrqCounts>,
+}
+
+impl IrqWatch {
+    pub fn start(cpu: Option<usize>) -> Self {
+        IrqWatch { cpu, before: cpu.and_then(irq_counts) }
+    }
+
+    /// Interruptions reçues depuis `start`, de la plus fréquente à la plus rare.
+    pub fn finish(self) -> Option<Vec<IrqDelta>> {
+        let before = self.before?;
+        let after = irq_counts(self.cpu?)?;
+        let mut deltas: Vec<IrqDelta> = after
+            .into_iter()
+            .filter_map(|(name, (value, description))| {
+                let prev = before.get(&name).map(|v| v.0).unwrap_or(0);
+                (value > prev).then(|| IrqDelta { name, count: value - prev, description })
+            })
+            .collect();
+        deltas.sort_by_key(|d| std::cmp::Reverse(d.count));
+        Some(deltas)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// /dev/cpu_dma_latency
+// ---------------------------------------------------------------------------
+
+/// Tant que cette garde existe, le noyau limite les C-states (sur toute la machine).
+pub struct DmaLatency(#[allow(dead_code)] File);
+
+impl DmaLatency {
+    pub fn hold(us: Option<i32>) -> Result<Option<Self>> {
+        let Some(us) = us else { return Ok(None) };
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open("/dev/cpu_dma_latency")
+            .map_err(|e| format!("/dev/cpu_dma_latency : {e} (root nécessaire)"))?;
+        file.write_all(&us.to_ne_bytes()).map_err(|e| format!("/dev/cpu_dma_latency : {e}"))?;
+        eprintln!("/dev/cpu_dma_latency = {us} µs pendant la mesure (toute la machine)");
+        Ok(Some(DmaLatency(file)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_cpulist;
+
+    #[test]
+    fn cpulist() {
+        assert_eq!(parse_cpulist("0-3,6,8-9"), vec![0, 1, 2, 3, 6, 8, 9]);
+        assert_eq!(parse_cpulist(""), Vec::<usize>::new());
+        assert_eq!(parse_cpulist("7"), vec![7]);
+    }
+}
+__FIN_FICHIER_09__
+
+ecrire 'src/stats.rs' <<'__FIN_FICHIER_10__'
+//! Statistiques de latence, sans allocation pendant la mesure.
+//!
+//! - histogramme à deux résolutions : 10 ns jusqu'à 100 µs, puis 1 µs jusqu'à 100 ms,
+//!   puis un seau de débordement ;
+//! - les N pires échantillons, avec leur date ;
+//! - une série temporelle de `WINDOWS` fenêtres (nombre, min, moyenne, max).
+
+const FINE_LIMIT: u64 = 100_000;
+const FINE_STEP: u64 = 10;
+const COARSE_LIMIT: u64 = 100_000_000;
+const COARSE_STEP: u64 = 1_000;
+const FINE_BUCKETS: usize = (FINE_LIMIT / FINE_STEP) as usize;
+const COARSE_BUCKETS: usize = ((COARSE_LIMIT - FINE_LIMIT) / COARSE_STEP) as usize;
+const BUCKETS: usize = FINE_BUCKETS + COARSE_BUCKETS + 1;
+
+/// Nombre de fenêtres de la série temporelle.
+pub const WINDOWS: usize = 2000;
+
+#[inline(always)]
+fn bucket_of(ns: u64) -> usize {
+    if ns < FINE_LIMIT {
+        (ns / FINE_STEP) as usize
+    } else if ns < COARSE_LIMIT {
+        FINE_BUCKETS + ((ns - FINE_LIMIT) / COARSE_STEP) as usize
+    } else {
+        BUCKETS - 1
+    }
+}
+
+fn bucket_low(i: usize) -> u64 {
+    if i < FINE_BUCKETS {
+        i as u64 * FINE_STEP
+    } else if i < BUCKETS - 1 {
+        FINE_LIMIT + (i - FINE_BUCKETS) as u64 * COARSE_STEP
+    } else {
+        COARSE_LIMIT
+    }
+}
+
+fn bucket_high(i: usize) -> u64 {
+    if i < BUCKETS - 1 {
+        bucket_low(i + 1)
+    } else {
+        u64::MAX
+    }
+}
+
+/// Un échantillon remarquable.
+#[derive(Clone, Copy, Debug)]
+pub struct Sample {
+    /// valeur mesurée (ns)
+    pub ns: u64,
+    /// numéro de l'échantillon
+    pub index: u64,
+    /// date depuis le début de la mesure (ns)
+    pub at: u64,
+}
+
+/// Agrégat d'une fenêtre de la série temporelle.
+#[derive(Clone, Copy, Debug)]
+pub struct Window {
+    pub index: usize,
+    pub count: u64,
+    pub min: u64,
+    pub mean: u64,
+    pub max: u64,
+}
+
+pub struct Stats {
+    hist: Vec<u64>,
+    count: u64,
+    sum: u128,
+    min: u64,
+    max: u64,
+    worst: Vec<Sample>, // trié croissant : worst[0] est le moins mauvais des pires
+    worst_capacity: usize,
+    window_ns: u64,
+    w_count: Vec<u64>,
+    w_sum: Vec<u64>,
+    w_min: Vec<u64>,
+    w_max: Vec<u64>,
+}
+
+impl Stats {
+    /// Tout est alloué et touché ici, pour qu'aucun défaut de page n'arrive pendant
+    /// la mesure.
+    pub fn new(worst_capacity: usize, duration_ns: u64) -> Self {
+        let mut hist = vec![0u64; BUCKETS];
+        // calloc donne des pages paresseuses : on les écrit maintenant
+        for i in (0..hist.len()).step_by(512) {
+            unsafe { std::ptr::write_volatile(&mut hist[i], 0) };
+        }
+        let mut worst = Vec::with_capacity(worst_capacity + 1);
+        worst.resize(worst_capacity + 1, Sample { ns: 0, index: 0, at: 0 });
+        worst.clear();
+        Stats {
+            hist,
+            count: 0,
+            sum: 0,
+            min: u64::MAX,
+            max: 0,
+            worst,
+            worst_capacity,
+            window_ns: (duration_ns / WINDOWS as u64).max(1),
+            w_count: vec![0; WINDOWS],
+            w_sum: vec![0; WINDOWS],
+            w_min: vec![u64::MAX; WINDOWS],
+            w_max: vec![0; WINDOWS],
+        }
+    }
+
+    /// Enregistre un échantillon : `ns` mesuré, `index` son numéro, `at` sa date.
+    #[inline(always)]
+    pub fn record(&mut self, ns: u64, index: u64, at: u64) {
+        self.hist[bucket_of(ns)] += 1;
+        self.count += 1;
+        self.sum += ns as u128;
+        self.min = self.min.min(ns);
+        self.max = self.max.max(ns);
+
+        let w = ((at / self.window_ns) as usize).min(WINDOWS - 1);
+        self.w_count[w] += 1;
+        self.w_sum[w] += ns;
+        self.w_min[w] = self.w_min[w].min(ns);
+        self.w_max[w] = self.w_max[w].max(ns);
+
+        let sample = Sample { ns, index, at };
+        if self.worst.len() < self.worst_capacity {
+            self.worst.push(sample);
+            self.worst.sort_unstable_by_key(|s| s.ns);
+        } else if self.worst_capacity > 0 && ns > self.worst[0].ns {
+            self.worst[0] = sample;
+            self.worst.sort_unstable_by_key(|s| s.ns);
+        }
+    }
+
+    pub fn count(&self) -> u64 {
+        self.count
+    }
+    pub fn sum(&self) -> u128 {
+        self.sum
+    }
+    pub fn min(&self) -> u64 {
+        if self.count == 0 {
+            0
+        } else {
+            self.min
+        }
+    }
+    pub fn max(&self) -> u64 {
+        self.max
+    }
+    pub fn mean(&self) -> u64 {
+        if self.count == 0 {
+            0
+        } else {
+            (self.sum / self.count as u128) as u64
+        }
+    }
+    pub fn window_ns(&self) -> u64 {
+        self.window_ns
+    }
+
+    /// Valeur au quantile `q` (0..1). Renvoie la borne haute du seau : estimation
+    /// prudente, jamais au-dessus du maximum observé.
+    pub fn percentile(&self, q: f64) -> u64 {
+        if self.count == 0 {
+            return 0;
+        }
+        let target = ((q * self.count as f64).ceil() as u64).max(1);
+        let mut seen = 0;
+        for (i, &c) in self.hist.iter().enumerate() {
+            seen += c;
+            if seen >= target {
+                return bucket_high(i).min(self.max);
+            }
+        }
+        self.max
+    }
+
+    /// Nombre d'échantillons ≥ `ns` (exact si `ns` tombe sur une limite de seau).
+    pub fn count_at_least(&self, ns: u64) -> u64 {
+        self.hist.iter().enumerate().filter(|(i, _)| bucket_low(*i) >= ns).map(|(_, c)| c).sum()
+    }
+
+    /// Seaux non vides : (borne basse, borne haute, nombre), en ns.
+    pub fn buckets(&self) -> impl Iterator<Item = (u64, u64, u64)> + '_ {
+        self.hist.iter().enumerate().filter(|(_, &c)| c > 0).map(|(i, &c)| {
+            let high = if i == BUCKETS - 1 { self.max } else { bucket_high(i) };
+            (bucket_low(i), high, c)
+        })
+    }
+
+    /// Fenêtres non vides de la série temporelle.
+    pub fn windows(&self) -> impl Iterator<Item = Window> + '_ {
+        (0..WINDOWS).filter(|&w| self.w_count[w] > 0).map(|w| Window {
+            index: w,
+            count: self.w_count[w],
+            min: self.w_min[w],
+            mean: self.w_sum[w] / self.w_count[w],
+            max: self.w_max[w],
+        })
+    }
+
+    /// Pires échantillons, du pire au moins mauvais.
+    pub fn worst(&self) -> impl Iterator<Item = &Sample> {
+        self.worst.iter().rev()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn buckets_round_trip() {
+        for ns in [0, 9, 10, 99_999, 100_000, 100_999, 5_000_000, 99_999_999, 200_000_000] {
+            let b = bucket_of(ns);
+            assert!(bucket_low(b) <= ns, "{ns}");
+            assert!(ns < bucket_high(b), "{ns}");
+        }
+    }
+
+    #[test]
+    fn percentiles_and_worst() {
+        let mut s = Stats::new(3, 1_000_000);
+        for i in 1..=1000u64 {
+            s.record(i * 1000, i, i * 1000);
+        }
+        assert_eq!(s.count(), 1000);
+        assert_eq!(s.min(), 1000);
+        assert_eq!(s.max(), 1_000_000);
+        assert!((499_000..=501_000).contains(&s.percentile(0.5)));
+        let worst: Vec<u64> = s.worst().map(|w| w.ns).collect();
+        assert_eq!(worst, vec![1_000_000, 999_000, 998_000]);
+        assert_eq!(s.count_at_least(900_000), 101);
+    }
+}
+__FIN_FICHIER_10__
+
+ecrire 'src/report.rs' <<'__FIN_FICHIER_11__'
+//! Résultat d'une mesure, rapport terminal et diagnostic.
+
+use crate::cli::MeasureArgs;
+use crate::clock::fmt_ns;
+use crate::sched::{self, policy_name, Policy, Usage};
+use crate::stats::Stats;
+use crate::system::{self, IrqDelta};
+use crate::{export, ui, Result};
+
+/// Seuils affichés dans « au-delà de ».
+const THRESHOLDS: [(u64, &str); 6] = [
+    (10_000, "10 µs"),
+    (20_000, "20 µs"),
+    (50_000, "50 µs"),
+    (100_000, "100 µs"),
+    (1_000_000, "1 ms"),
+    (10_000_000, "10 ms"),
+];
+
+/// Relevés pris dans le thread mesuré, juste avant la boucle.
+pub struct Probe {
+    cpu_start: i32,
+    affinity: Vec<usize>,
+    usage: Usage,
+}
+
+impl Probe {
+    pub fn start() -> Self {
+        Probe { cpu_start: sched::current_cpu(), affinity: sched::affinity(), usage: Usage::of_thread() }
+    }
+
+    /// À appeler dans le thread mesuré, juste après la boucle.
+    pub fn finish(self, stats: Stats, notes: Vec<(&'static str, String)>) -> Measurement {
+        Measurement {
+            usage: Usage::of_thread().since(self.usage),
+            cpu_start: self.cpu_start,
+            cpu_end: sched::current_cpu(),
+            scheduler: sched::scheduler(),
+            affinity: self.affinity,
+            stats,
+            notes,
+        }
+    }
+}
+
+/// Tout ce qu'une mesure produit.
+pub struct Measurement {
+    pub stats: Stats,
+    pub usage: Usage,
+    pub cpu_start: i32,
+    pub cpu_end: i32,
+    /// (politique brute, priorité) effectivement appliquées
+    pub scheduler: (i32, i32),
+    pub affinity: Vec<usize>,
+    /// lignes propres au mode (« période », « transport »…)
+    pub notes: Vec<(&'static str, String)>,
+}
+
+/// Contexte d'une mesure, pour le rapport et l'export.
+pub struct Run<'a> {
+    pub title: &'a str,
+    pub mode: &'a str,
+    pub common: &'a MeasureArgs,
+    pub policy: Policy,
+    pub warmup: u64,
+    /// métadonnées propres au mode, ajoutées au JSON
+    pub meta: Vec<(&'static str, String)>,
+}
+
+impl Run<'_> {
+    pub fn load_description(&self) -> String {
+        match &self.common.load.cpus {
+            Some(cpus) => format!("{} sur {:?}", self.common.load.kind.name(), cpus.0),
+            None => "aucune".into(),
+        }
+    }
+}
+
+/// Affiche le rapport, puis écrit les exports demandés.
+pub fn present(run: &Run, m: &Measurement, irqs: Option<Vec<IrqDelta>>) -> Result<()> {
+    print_summary(run, m);
+    if m.stats.count() == 0 {
+        return Ok(());
+    }
+    print_worst(m);
+    print_side_effects(run, m, irqs.as_deref());
+    print_diagnostics(run, m);
+    export::write_requested(run, m)
+}
+
+fn print_summary(run: &Run, m: &Measurement) {
+    let st = &m.stats;
+    ui::section(run.title);
+    ui::row(
+        "thread",
+        format!(
+            "{} {} · CPU {} → {} · affinité {:?}",
+            policy_name(m.scheduler.0),
+            m.scheduler.1,
+            m.cpu_start,
+            m.cpu_end,
+            m.affinity
+        ),
+    );
+    if let Some(cpu) = run.common.cpu {
+        ui::row(
+            &format!("cœur {cpu}"),
+            format!(
+                "isolé {} · nohz_full {} · mémoire verrouillée {}",
+                ui::yes_no(system::isolated_cpus().contains(&cpu)),
+                ui::yes_no(system::nohz_full_cpus().contains(&cpu)),
+                ui::yes_no(!run.common.no_mlock)
+            ),
+        );
+    }
+    if run.common.load.cpus.is_some() {
+        ui::row("charge parasite", run.load_description());
+    }
+    for (label, value) in &m.notes {
+        ui::row(label, value);
+    }
+
+    if st.count() == 0 {
+        ui::finding(
+            false,
+            &format!("aucun échantillon : durée trop courte par rapport à --warmup {} ?", run.warmup),
+        );
+        return;
+    }
+    println!();
+    ui::row(
+        "échantillons",
+        format!("{} ({} ignorés en échauffement)", ui::count(st.count()), ui::count(run.warmup)),
+    );
+    ui::row(
+        "min · moy · max",
+        format!("{} · {} · {}", fmt_ns(st.min()), fmt_ns(st.mean()), ui::bold(&fmt_ns(st.max()))),
+    );
+    let pct = |q: f64| fmt_ns(st.percentile(q));
+    ui::row(
+        "percentiles",
+        format!(
+            "p50 {} · p99 {} · p99.9 {} · p99.99 {} · p99.999 {}",
+            pct(0.5),
+            pct(0.99),
+            pct(0.999),
+            pct(0.9999),
+            pct(0.99999)
+        ),
+    );
+    let over: Vec<String> = THRESHOLDS
+        .iter()
+        .map(|(ns, label)| format!("{label} : {}", ui::count(st.count_at_least(*ns))))
+        .collect();
+    ui::row("au-delà de", over.join(" · "));
+}
+
+fn print_worst(m: &Measurement) {
+    let worst: Vec<_> = m.stats.worst().copied().collect();
+    if worst.is_empty() {
+        return;
+    }
+    ui::section("pires échantillons");
+    for (rank, s) in worst.iter().enumerate() {
+        println!(
+            "  #{:<3} {:>12}   à t = {:>9.3} s   (échantillon n° {})",
+            rank + 1,
+            fmt_ns(s.ns),
+            s.at as f64 / 1e9,
+            ui::count(s.index)
+        );
+    }
+    // Dans l'ordre chronologique : des écarts réguliers trahissent une cause périodique.
+    let mut chrono = worst;
+    chrono.sort_by_key(|s| s.at);
+    let gaps: Vec<String> = chrono.windows(2).map(|w| format!("{:.3}", (w[1].at - w[0].at) as f64 / 1e9)).collect();
+    if !gaps.is_empty() {
+        println!();
+        ui::row("écarts entre eux", format!("{} s (ordre chronologique)", gaps.join(" ")));
+    }
+}
+
+fn print_side_effects(run: &Run, m: &Measurement, irqs: Option<&[IrqDelta]>) {
+    ui::section("pendant la mesure");
+    ui::row(
+        "défauts de page",
+        format!("{} mineurs · {} majeurs", m.usage.minor_faults, m.usage.major_faults),
+    );
+    ui::row(
+        "changements de ctx",
+        format!(
+            "{} volontaires · {} involontaires (préemptions)",
+            ui::count(m.usage.voluntary_switches.max(0) as u64),
+            m.usage.involuntary_switches
+        ),
+    );
+    if let (Some(cpu), Some(irqs)) = (run.common.cpu, irqs) {
+        if irqs.is_empty() {
+            ui::row(&format!("IRQ sur CPU {cpu}"), "aucune");
+        } else {
+            ui::row(&format!("IRQ sur CPU {cpu}"), "");
+            for irq in irqs.iter().take(12) {
+                println!("      {:>6} {:>10}  {}", irq.name, ui::count(irq.count), ui::dim(&irq.description));
+            }
+        }
+    }
+}
+
+fn print_diagnostics(run: &Run, m: &Measurement) {
+    let mut findings = Vec::new();
+    if m.cpu_start != m.cpu_end {
+        findings.push("le thread a changé de cœur pendant la mesure : affinité non appliquée ?".to_string());
+    }
+    let faults = m.usage.minor_faults + m.usage.major_faults;
+    if faults > 0 {
+        findings.push(format!("{faults} défaut(s) de page pendant la mesure : mémoire non verrouillée ?"));
+    }
+    if m.usage.involuntary_switches > 0 {
+        findings.push(format!(
+            "thread préempté {} fois : une tâche plus prioritaire (ou le bridage RT) a pris le cœur",
+            m.usage.involuntary_switches
+        ));
+    }
+    if run.policy.is_realtime() && m.stats.max() >= 10_000_000 && system::rt_throttling_enabled() {
+        findings.push(format!(
+            "pause de {} en temps réel avec sched_rt_runtime_us = {} : signature du bridage RT \
+             (cœur occupé à 100 % en RT pendant ~1 s)",
+            fmt_ns(m.stats.max()),
+            system::rt_runtime_us()
+        ));
+    }
+    if let Some(cpu) = run.common.cpu {
+        if !system::isolated_cpus().contains(&cpu) {
+            findings.push(format!("le CPU {cpu} n'est pas isolé : d'autres tâches peuvent y tourner"));
+        }
+    }
+
+    ui::section("diagnostic");
+    if findings.is_empty() {
+        ui::finding(true, "rien à signaler");
+    }
+    for f in &findings {
+        ui::finding(false, f);
+    }
+}
+
+/// Prévient quand une boucle active en temps réel va déclencher le bridage RT.
+pub fn warn_busy_realtime(policy: Policy) {
+    if policy.is_realtime() && system::rt_throttling_enabled() {
+        ui::warn(&format!(
+            "boucle active en {policy:?} avec sched_rt_runtime_us = {} : attendez-vous à des pauses \
+             de quelques dizaines de ms chaque seconde (bridage RT). --policy other pour l'éviter.",
+            system::rt_runtime_us()
+        ));
+    }
+}
+__FIN_FICHIER_11__
+
+ecrire 'src/export.rs' <<'__FIN_FICHIER_12__'
+//! Export des résultats : JSON complet (pour rtlat_plot.py) et histogramme CSV.
+
+use std::fmt::Write as _;
+use std::fs;
+use std::path::Path;
+
+use crate::report::{Measurement, Run};
+use crate::sched::policy_name;
+use crate::stats::Stats;
+use crate::system;
+use crate::{ui, Result};
+
+/// Écrit les fichiers demandés par --out et --csv.
+pub fn write_requested(run: &Run, m: &Measurement) -> Result<()> {
+    if let Some(path) = &run.common.out {
+        write_json(path, &metadata(run, m), &m.stats)?;
+        println!(
+            "\n  {} {}  {}",
+            ui::green("→"),
+            path.display(),
+            ui::dim(&format!("(tracé : python3 rtlat_plot.py {})", path.display()))
+        );
+    }
+    if let Some(path) = &run.common.csv {
+        write_csv(path, &m.stats)?;
+        println!("  {} {}", ui::green("→"), path.display());
+    }
+    Ok(())
+}
+
+fn metadata(run: &Run, m: &Measurement) -> Vec<(&'static str, String)> {
+    let uname = system::uname();
+    let epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut meta = vec![
+        ("title", run.title.to_string()),
+        ("mode", run.mode.to_string()),
+        ("cpu", run.common.cpu.map(|c| c.to_string()).unwrap_or_default()),
+        ("policy", policy_name(m.scheduler.0).to_string()),
+        ("prio", m.scheduler.1.to_string()),
+        ("duration_s", format!("{}", run.common.duration.as_secs_f64())),
+        ("warmup", run.warmup.to_string()),
+        ("load", run.load_description()),
+        ("kernel", uname.release),
+        ("host", uname.nodename),
+        ("epoch", epoch.to_string()),
+    ];
+    meta.extend(run.meta.iter().cloned());
+    meta
+}
+
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn json_rows<I, const N: usize>(rows: I) -> String
+where
+    I: Iterator<Item = [u64; N]>,
+{
+    let rows: Vec<String> = rows
+        .map(|r| format!("[{}]", r.iter().map(u64::to_string).collect::<Vec<_>>().join(",")))
+        .collect();
+    format!("[{}]", rows.join(","))
+}
+
+fn write_json(path: &Path, meta: &[(&str, String)], st: &Stats) -> Result<()> {
+    let meta_fields: Vec<String> =
+        meta.iter().map(|(k, v)| format!("{}: {}", json_string(k), json_string(v))).collect();
+    let percentiles: Vec<String> = [(0.5, "50"), (0.9, "90"), (0.99, "99"), (0.999, "99.9"), (0.9999, "99.99"), (0.99999, "99.999")]
+        .iter()
+        .map(|(q, key)| format!("\"{key}\": {}", st.percentile(*q)))
+        .collect();
+
+    let mut json = String::from("{\n");
+    let _ = writeln!(json, "  \"meta\": {{{}}},", meta_fields.join(", "));
+    let _ = writeln!(
+        json,
+        "  \"count\": {}, \"sum_ns\": {}, \"min_ns\": {}, \"avg_ns\": {}, \"max_ns\": {},",
+        st.count(),
+        st.sum(),
+        st.min(),
+        st.mean(),
+        st.max()
+    );
+    let _ = writeln!(json, "  \"percentiles\": {{{}}},", percentiles.join(", "));
+    let _ = writeln!(json, "  \"hist\": {},", json_rows(st.buckets().map(|(lo, hi, n)| [lo, hi, n])));
+    let _ = writeln!(json, "  \"window_ns\": {},", st.window_ns());
+    let _ = writeln!(
+        json,
+        "  \"windows\": {},",
+        json_rows(st.windows().map(|w| [w.index as u64, w.count, w.min, w.mean, w.max]))
+    );
+    let _ = writeln!(json, "  \"top\": {}", json_rows(st.worst().map(|s| [s.ns, s.index, s.at])));
+    json.push_str("}\n");
+
+    fs::write(path, json).map_err(|e| format!("écriture de {} : {e}", path.display()))
+}
+
+fn write_csv(path: &Path, st: &Stats) -> Result<()> {
+    let mut csv = String::from("borne_basse_ns,borne_haute_ns,nombre\n");
+    for (lo, hi, n) in st.buckets() {
+        let _ = writeln!(csv, "{lo},{hi},{n}");
+    }
+    fs::write(path, csv).map_err(|e| format!("écriture de {} : {e}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn escaping() {
+        assert_eq!(super::json_string(r#"a"b\c"#), r#""a\"b\\c""#);
+    }
+}
+__FIN_FICHIER_12__
+
+ecrire 'src/load.rs' <<'__FIN_FICHIER_13__'
+//! Charge parasite (« voisin bruyant ») : sature cache et mémoire sur des cœurs
+//! non isolés pendant une mesure, comme le recommandent les méthodologies RT.
+
+use std::ffi::CString;
+use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
+
+use crate::cli::{LoadArgs, LoadKind, LoadOpts};
+use crate::sched::set_affinity;
+use crate::{ui, Result};
+
+/// Taille de chaque tampon memcpy : largement plus que le cache L3.
+const BUFFER_SIZE: usize = 32 << 20;
+
+/// Sous-commande `load` : charge les cœurs demandés pendant la durée demandée.
+pub fn run(args: &LoadArgs) -> Result<()> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let workers: Vec<_> = args
+        .cpus
+        .0
+        .iter()
+        .enumerate()
+        .map(|(n, &cpu)| {
+            let kind = match args.kind {
+                LoadKind::Mixed if n % 2 == 1 => LoadKind::Cpu,
+                LoadKind::Mixed => LoadKind::Memcpy,
+                k => k,
+            };
+            let stop = stop.clone();
+            thread::spawn(move || worker(cpu, kind, &stop))
+        })
+        .collect();
+
+    eprintln!(
+        "charge {} sur les CPU {:?} pendant {:.0} s",
+        args.kind.name(),
+        args.cpus.0,
+        args.duration.as_secs_f64()
+    );
+    thread::sleep(args.duration);
+    stop.store(true, Ordering::Relaxed);
+    for w in workers {
+        let _ = w.join();
+    }
+    Ok(())
+}
+
+fn worker(cpu: usize, kind: LoadKind, stop: &AtomicBool) {
+    if let Err(e) = set_affinity(cpu) {
+        ui::warn(&format!("charge : {e}"));
+        return;
+    }
+    match kind {
+        LoadKind::Memcpy | LoadKind::Mixed => {
+            let mut a = vec![1u8; BUFFER_SIZE];
+            let mut b = vec![2u8; BUFFER_SIZE];
+            while !stop.load(Ordering::Relaxed) {
+                b.copy_from_slice(&a);
+                std::mem::swap(&mut a, &mut b);
+                std::hint::black_box(&b);
+            }
+        }
+        LoadKind::Cpu => {
+            let mut x = 1u64;
+            while !stop.load(Ordering::Relaxed) {
+                for _ in 0..1_000_000 {
+                    x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                }
+                std::hint::black_box(x);
+            }
+        }
+    }
+}
+
+/// Charge lancée dans un process séparé pendant une mesure : sa mémoire n'est pas
+/// concernée par le mlockall du process de mesure. Arrêtée automatiquement à la fin.
+pub struct LoadChild {
+    pid: libc::pid_t,
+}
+
+impl LoadChild {
+    pub fn spawn(opts: &LoadOpts, measured_cpu: Option<usize>, duration: Duration) -> Option<Self> {
+        let cpus = opts.cpus.as_ref()?;
+        if let Some(cpu) = measured_cpu.filter(|c| cpus.0.contains(c)) {
+            ui::warn(&format!("la charge tourne aussi sur le CPU mesuré ({cpu})"));
+        }
+        let exe = std::env::current_exe().ok()?.into_os_string().into_string().ok()?;
+        let secs = format!("{}", duration.as_secs_f64() + 10.0); // marge : on l'arrête nous-mêmes
+        let args = [exe.as_str(), "load", "--cpus", &cpus.to_arg(), "--kind", opts.kind.name(), "--duration", &secs];
+        match spawn_process(&args) {
+            Ok(pid) => {
+                thread::sleep(Duration::from_secs(1)); // laisse la charge s'installer
+                Some(LoadChild { pid })
+            }
+            Err(e) => {
+                ui::warn(&format!("impossible de lancer la charge : {e}"));
+                None
+            }
+        }
+    }
+}
+
+impl Drop for LoadChild {
+    fn drop(&mut self) {
+        unsafe {
+            libc::kill(self.pid, libc::SIGTERM);
+            libc::waitpid(self.pid, std::ptr::null_mut(), 0);
+        }
+    }
+}
+
+/// posix_spawn plutôt que std::process::Command : Command fait dépendre le binaire
+/// de symboles glibc 2.39, alors qu'OL9 n'a que la glibc 2.34.
+fn spawn_process(args: &[&str]) -> io::Result<libc::pid_t> {
+    extern "C" {
+        static environ: *const *mut libc::c_char;
+    }
+    let cargs: Vec<CString> =
+        args.iter().map(|a| CString::new(*a)).collect::<std::result::Result<_, _>>().map_err(io::Error::other)?;
+    let mut argv: Vec<*mut libc::c_char> = cargs.iter().map(|c| c.as_ptr() as *mut libc::c_char).collect();
+    argv.push(std::ptr::null_mut());
+    let mut pid: libc::pid_t = 0;
+    let rc = unsafe {
+        libc::posix_spawn(&mut pid, cargs[0].as_ptr(), std::ptr::null(), std::ptr::null(), argv.as_ptr(), environ)
+    };
+    if rc == 0 {
+        Ok(pid)
+    } else {
+        Err(io::Error::from_raw_os_error(rc))
+    }
+}
+__FIN_FICHIER_13__
+
+ecrire 'src/modes/mod.rs' <<'__FIN_FICHIER_14__'
+//! Une sous-commande par fichier.
+
+pub mod check;
+pub mod pingpong;
+pub mod stall;
+pub mod timer;
+__FIN_FICHIER_14__
+
+ecrire 'src/modes/check.rs' <<'__FIN_FICHIER_15__'
+//! `rtlat check` : état de la configuration temps réel et diagnostic.
+
+use crate::cli::CheckArgs;
+use crate::sched::{self, policy_name, Policy};
+use crate::system::{self, read_trim};
+use crate::{ui, Result};
+
+/// Bits de CapEff utiles ici (linux/capability.h).
+const CAP_IPC_LOCK: u32 = 14;
+const CAP_SYS_ADMIN: u32 = 21;
+const CAP_SYS_NICE: u32 = 23;
+
+/// Au-delà, un état de veille est jugé lent pour du temps réel.
+const SLOW_IDLE_EXIT_US: u64 = 10;
+
+pub fn run(args: &CheckArgs) -> Result<()> {
+    let mut findings: Vec<String> = Vec::new();
+
+    check_system(&mut findings);
+    check_process(&mut findings);
+    if let Some(cpu) = args.cpu {
+        check_cpu(cpu, &mut findings);
+    }
+    run_tests(args, &mut findings);
+
+    ui::section("diagnostic");
+    if findings.is_empty() {
+        ui::finding(true, "rien à signaler");
+    }
+    for f in &findings {
+        ui::finding(false, f);
+    }
+    Ok(())
+}
+
+fn sys(path: &str) -> String {
+    read_trim(path).unwrap_or_else(|| "absent".into())
+}
+
+fn check_system(findings: &mut Vec<String>) {
+    ui::section("système");
+    let uname = system::uname();
+    let preempt_rt = std::path::Path::new("/sys/kernel/realtime").exists() || uname.version.contains("PREEMPT_RT");
+    ui::row("noyau", format!("{} {}", uname.release, ui::dim(&uname.version)));
+    ui::row("PREEMPT_RT", if preempt_rt { ui::green("oui") } else { "non (noyau standard)".into() });
+    ui::row("ligne de commande", sys("/proc/cmdline"));
+
+    let isolated = system::isolated_cpus();
+    let nohz = system::nohz_full_cpus();
+    ui::row("cœurs isolés", if isolated.is_empty() { "aucun".into() } else { format!("{isolated:?}") });
+    ui::row("nohz_full", if nohz.is_empty() { "aucun".into() } else { format!("{nohz:?}") });
+
+    let runtime = system::rt_runtime_us();
+    ui::row(
+        "bridage RT",
+        format!("sched_rt_runtime_us = {runtime} / période {}", sys("/proc/sys/kernel/sched_rt_period_us")),
+    );
+    if system::rt_throttling_enabled() {
+        findings.push(format!(
+            "bridage RT actif ({runtime} µs par seconde) : une tâche RT à 100 % est suspendue jusqu'à ~50 ms par seconde"
+        ));
+    }
+
+    let thp = sys("/sys/kernel/mm/transparent_hugepage/enabled");
+    ui::row("THP", &thp);
+    if thp.contains("[always]") {
+        findings.push("THP en mode always : compactage mémoire possible pendant un défaut de page".into());
+    }
+}
+
+fn check_process(findings: &mut Vec<String>) {
+    ui::section("ce process");
+    ui::row("CPU autorisés", system::status_field("Cpus_allowed_list:").unwrap_or("?".into()));
+    let cap_hex = system::status_field("CapEff:").unwrap_or_default();
+    let caps = u64::from_str_radix(&cap_hex, 16).unwrap_or(0);
+    let has = |bit: u32| caps & (1u64 << bit) != 0;
+    ui::row(
+        "capabilities",
+        format!(
+            "SYS_NICE {} · IPC_LOCK {} · SYS_ADMIN {}  {}",
+            ui::yes_no(has(CAP_SYS_NICE)),
+            ui::yes_no(has(CAP_IPC_LOCK)),
+            ui::yes_no(has(CAP_SYS_ADMIN)),
+            ui::dim(&format!("(CapEff {cap_hex})"))
+        ),
+    );
+    ui::row("RLIMIT_RTPRIO", system::rlimit(libc::RLIMIT_RTPRIO as i32));
+    ui::row("RLIMIT_MEMLOCK", system::rlimit(libc::RLIMIT_MEMLOCK as i32));
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+    ui::row("cgroup", cgroup.lines().next().unwrap_or("?"));
+    if !has(CAP_SYS_NICE) {
+        findings.push("pas de CAP_SYS_NICE : impossible de passer en SCHED_FIFO/RR".into());
+    }
+}
+
+fn check_cpu(cpu: usize, findings: &mut Vec<String>) {
+    ui::section(&format!("CPU {cpu}"));
+    if !system::isolated_cpus().contains(&cpu) {
+        findings.push(format!("CPU {cpu} n'est pas isolé (isolcpus)"));
+    }
+    if !system::nohz_full_cpus().contains(&cpu) {
+        findings.push(format!("CPU {cpu} n'est pas en nohz_full : le tick noyau continue"));
+    }
+
+    let freq = |f: &str| sys(&format!("/sys/devices/system/cpu/cpu{cpu}/cpufreq/{f}"));
+    let governor = freq("scaling_governor");
+    ui::row(
+        "fréquence",
+        format!(
+            "gouverneur {governor} · actuelle {} kHz · min {} · max {}",
+            freq("scaling_cur_freq"),
+            freq("scaling_min_freq"),
+            freq("scaling_max_freq")
+        ),
+    );
+    if governor != "performance" && governor != "absent" {
+        findings.push(format!(
+            "gouverneur {governor} sur CPU {cpu} : la fréquence varie (cpupower -c {cpu} frequency-set -g performance)"
+        ));
+    }
+
+    ui::row("pilote cpuidle", sys("/sys/devices/system/cpu/cpuidle/current_driver"));
+    let states = system::idle_states(cpu);
+    if !states.is_empty() {
+        ui::row("états de veille", "");
+    }
+    let mut slow = Vec::new();
+    for s in &states {
+        println!(
+            "      state{:<2} {:<10} sortie {:>4} µs   {}   utilisé {} fois",
+            s.index,
+            s.name,
+            s.exit_latency_us,
+            if s.disabled { ui::dim("désactivé") } else { "actif    ".to_string() },
+            ui::count(s.usage)
+        );
+        if !s.disabled && s.exit_latency_us > SLOW_IDLE_EXIT_US {
+            slow.push(format!("{} ({} µs)", s.name, s.exit_latency_us));
+        }
+    }
+    if !slow.is_empty() {
+        findings.push(format!(
+            "états de veille lents actifs sur CPU {cpu} : {} (cpupower -c {cpu} idle-set -D {SLOW_IDLE_EXIT_US})",
+            slow.join(", ")
+        ));
+    }
+
+    if let Some(counts) = system::irq_counts(cpu) {
+        let mut top: Vec<_> = counts.iter().filter(|(_, (n, _))| *n > 0).collect();
+        top.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
+        ui::row("IRQ depuis le boot", "");
+        for (name, (n, desc)) in top.iter().take(8) {
+            println!("      {name:>6} {:>12}  {}", ui::count(*n), ui::dim(desc));
+        }
+    }
+}
+
+fn run_tests(args: &CheckArgs, findings: &mut Vec<String>) {
+    ui::section("tests");
+    let mut test = |label: &str, result: Result<String>, on_fail: &str| match result {
+        Ok(detail) => ui::row(label, format!("{} {detail}", ui::green("OK"))),
+        Err(e) => {
+            ui::row(label, format!("{} {e}", ui::red("ÉCHEC")));
+            findings.push(on_fail.to_string());
+        }
+    };
+
+    test(
+        "mlockall",
+        sched::lock_memory().map(|_| String::new()),
+        "mlockall impossible : défauts de page possibles pendant l'exécution RT",
+    );
+    if let Some(cpu) = args.cpu {
+        test(
+            &format!("épinglage CPU {cpu}"),
+            sched::set_affinity(cpu).map(|_| format!("(exécution sur CPU {})", sched::current_cpu())),
+            &format!("impossible de s'épingler sur le CPU {cpu} (cpuset du conteneur ?)"),
+        );
+    }
+    let fifo = sched::set_scheduler(Policy::Fifo, args.prio).map(|_| {
+        let (policy, prio) = sched::scheduler();
+        let _ = sched::set_scheduler(Policy::Other, 0);
+        format!("({} {prio})", policy_name(policy))
+    });
+    test(&format!("SCHED_FIFO {}", args.prio), fifo, "passage en SCHED_FIFO refusé");
+}
+__FIN_FICHIER_15__
+
+ecrire 'src/modes/timer.rs' <<'__FIN_FICHIER_16__'
+//! `rtlat timer` : retard de réveil d'un timer périodique.
+//!
+//! Même principe que cyclictest : le thread dort jusqu'à une échéance absolue, puis
+//! mesure de combien il s'est réveillé en retard. C'est la latence propre de la
+//! plateforme (noyau, interruptions, C-states, SMI), sans logique applicative.
+
+use crate::cli::TimerArgs;
+use crate::clock::{now_ns, sleep_until_ns};
+use crate::report::{self, Probe, Run};
+use crate::sched::{self, Policy, ThreadCfg};
+use crate::stats::Stats;
+use crate::system::IrqWatch;
+use crate::Result;
+
+pub fn run(args: &TimerArgs) -> Result<()> {
+    let common = &args.common;
+    let policy = common.policy.unwrap_or(Policy::Fifo);
+    let warmup = common.warmup.unwrap_or(100);
+    let thread = ThreadCfg { cpu: common.cpu, policy, prio: common.prio };
+    let interval_ns = args.interval * 1000;
+    let duration_ns = common.duration.as_nanos() as u64;
+    let top = common.top;
+
+    let irqs = IrqWatch::start(common.cpu);
+    let measurement = sched::run_in_thread("rtlat-timer", thread, move || {
+        let mut stats = Stats::new(top, duration_ns);
+        let probe = Probe::start();
+
+        let start = now_ns() + interval_ns;
+        let end = start + duration_ns;
+        let (mut deadline, mut n, mut missed) = (start, 0u64, 0u64);
+        while deadline < end {
+            sleep_until_ns(deadline);
+            let woke = now_ns();
+            if n >= warmup {
+                stats.record(woke.saturating_sub(deadline), n, woke - start);
+            }
+            n += 1;
+            deadline += interval_ns;
+            if woke >= deadline {
+                // une ou plusieurs périodes ratées : on se recale sur la suivante
+                let skipped = (woke - deadline) / interval_ns + 1;
+                missed += skipped;
+                deadline += skipped * interval_ns;
+            }
+        }
+
+        Ok(probe.finish(
+            stats,
+            vec![("période", format!("{} µs · {missed} période(s) ratée(s)", interval_ns / 1000))],
+        ))
+    })?;
+
+    let run = Run {
+        title: "latence de réveil du timer (retard sur l'échéance)",
+        mode: "timer",
+        common,
+        policy,
+        warmup,
+        meta: vec![("interval_us", args.interval.to_string())],
+    };
+    report::present(&run, &measurement, irqs.finish())
+}
+__FIN_FICHIER_16__
+
+ecrire 'src/modes/pingpong.rs' <<'__FIN_FICHIER_17__'
+//! `rtlat pingpong` : aller-retour entre deux threads.
+//!
+//! Le thread de mesure envoie 8 octets, le thread écho les renvoie, on mesure
+//! l'aller-retour. Trois canaux :
+//! - `unix` : socketpair AF_UNIX, le plus proche de ZeroMQ ipc:// ;
+//! - `pipe` : deux pipes ;
+//! - `spin` : une ligne de cache partagée en attente active, sans appel système :
+//!   le plancher matériel de la communication entre deux cœurs.
+
+use std::fs::File;
+use std::io::{self, Read, Write};
+use std::os::fd::FromRawFd;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Barrier, Mutex};
+use std::thread;
+
+use crate::cli::{PingpongArgs, Transport};
+use crate::clock::now_ns;
+use crate::report::{self, Measurement, Probe, Run};
+use crate::sched::{Policy, ThreadCfg};
+use crate::stats::Stats;
+use crate::system::IrqWatch;
+use crate::Result;
+
+/// Valeur qui demande au thread écho de s'arrêter.
+const STOP: u64 = u64::MAX;
+
+/// Une variable par ligne de cache (128 octets : la ligne et sa voisine préchargée).
+#[repr(align(128))]
+struct CacheLine(AtomicU64);
+
+struct SpinChannel {
+    ping: CacheLine,
+    pong: CacheLine,
+}
+
+/// Une extrémité du canal.
+enum Endpoint {
+    Fd { rx: File, tx: File },
+    Spin(Arc<SpinChannel>),
+}
+
+pub fn run(args: &PingpongArgs) -> Result<()> {
+    let common = &args.common;
+    let echo_cpu = args.cpu2.or(common.cpu);
+    if args.transport == Transport::Spin {
+        match (common.cpu, echo_cpu) {
+            (Some(a), Some(b)) if a != b => {}
+            _ => return Err("--transport spin exige --cpu et --cpu2 sur deux cœurs différents".into()),
+        }
+    }
+    // Spin = attente active : SCHED_OTHER par défaut pour éviter le bridage RT
+    let policy = common.policy.unwrap_or(match args.transport {
+        Transport::Spin => Policy::Other,
+        _ => Policy::Fifo,
+    });
+    if args.transport == Transport::Spin {
+        report::warn_busy_realtime(policy);
+    }
+    let warmup = common.warmup.unwrap_or(1000);
+    let measure_cfg = ThreadCfg { cpu: common.cpu, policy, prio: common.prio };
+    let echo_cfg = ThreadCfg { cpu: echo_cpu, ..measure_cfg };
+    let (measure_end, echo_end) = endpoints(args.transport)?;
+
+    let irqs = IrqWatch::start(common.cpu);
+    let measurement = run_pair(
+        measure_cfg,
+        echo_cfg,
+        measure_end,
+        echo_end,
+        common.duration.as_nanos() as u64,
+        warmup,
+        common.top,
+    )?;
+    let mut measurement = measurement;
+    measurement.notes.push((
+        "transport",
+        format!(
+            "{} · écho sur CPU {} · aller simple ≈ aller-retour / 2",
+            args.transport.name(),
+            echo_cpu.map_or("libre".into(), |c| c.to_string())
+        ),
+    ));
+
+    let run = Run {
+        title: "aller-retour entre deux threads",
+        mode: "pingpong",
+        common,
+        policy,
+        warmup,
+        meta: vec![
+            ("transport", args.transport.name().to_string()),
+            ("cpu2", echo_cpu.map(|c| c.to_string()).unwrap_or_default()),
+        ],
+    };
+    report::present(&run, &measurement, irqs.finish())
+}
+
+/// Lance les deux threads, les synchronise, et renvoie la mesure.
+fn run_pair(
+    measure_cfg: ThreadCfg,
+    echo_cfg: ThreadCfg,
+    measure_end: Endpoint,
+    echo_end: Endpoint,
+    duration_ns: u64,
+    warmup: u64,
+    top: usize,
+) -> Result<Measurement> {
+    // Les deux threads se configurent, puis s'attendent : si l'un échoue (droits
+    // insuffisants…), l'autre le voit et s'arrête proprement au lieu de bloquer.
+    let ready = Arc::new(Barrier::new(2));
+    let errors = Arc::new(Mutex::new(Vec::<String>::new()));
+    let spin = match &measure_end {
+        Endpoint::Spin(ch) => Some(ch.clone()),
+        Endpoint::Fd { .. } => None,
+    };
+
+    let echo = {
+        let (ready, errors) = (ready.clone(), errors.clone());
+        thread::Builder::new()
+            .name("rtlat-echo".into())
+            .stack_size(4 << 20)
+            .spawn(move || {
+                if let Err(e) = echo_cfg.apply() {
+                    errors.lock().unwrap().push(format!("thread écho : {e}"));
+                }
+                ready.wait();
+                if errors.lock().unwrap().is_empty() {
+                    echo_loop(echo_end);
+                }
+            })
+            .map_err(|e| format!("création du thread écho : {e}"))?
+    };
+
+    let measure = {
+        let (ready, errors) = (ready.clone(), errors.clone());
+        thread::Builder::new()
+            .name("rtlat-ping".into())
+            .stack_size(4 << 20)
+            .spawn(move || -> Result<Measurement> {
+                if let Err(e) = measure_cfg.apply() {
+                    errors.lock().unwrap().push(format!("thread de mesure : {e}"));
+                }
+                let mut stats = Stats::new(top, duration_ns);
+                ready.wait();
+                if let Some(e) = errors.lock().unwrap().first() {
+                    return Err(e.clone());
+                }
+                let probe = Probe::start();
+                measure_loop(measure_end, &mut stats, duration_ns, warmup)?;
+                Ok(probe.finish(stats, Vec::new()))
+            })
+            .map_err(|e| format!("création du thread de mesure : {e}"))?
+    };
+
+    let result = measure.join().map_err(|_| "le thread de mesure a paniqué".to_string())?;
+    if result.is_err() {
+        if let Some(ch) = spin {
+            ch.ping.0.store(STOP, Ordering::Release); // débloque l'écho en attente active
+        }
+    }
+    let _ = echo.join();
+    result
+}
+
+fn measure_loop(endpoint: Endpoint, stats: &mut Stats, duration_ns: u64, warmup: u64) -> Result<()> {
+    let start = now_ns();
+    let end = start + duration_ns;
+    let mut n = 0u64;
+    match endpoint {
+        Endpoint::Fd { mut rx, mut tx } => {
+            let mut buf = [0u8; 8];
+            loop {
+                let t0 = now_ns();
+                if t0 >= end {
+                    break;
+                }
+                tx.write_all(&t0.to_ne_bytes()).map_err(|e| format!("envoi : {e}"))?;
+                rx.read_exact(&mut buf).map_err(|e| format!("réception : {e}"))?;
+                let t1 = now_ns();
+                if n >= warmup {
+                    stats.record(t1 - t0, n, t0 - start);
+                }
+                n += 1;
+            }
+            let _ = tx.write_all(&STOP.to_ne_bytes());
+        }
+        Endpoint::Spin(ch) => {
+            loop {
+                let t0 = now_ns();
+                if t0 >= end {
+                    break;
+                }
+                let seq = n + 1;
+                ch.ping.0.store(seq, Ordering::Release);
+                while ch.pong.0.load(Ordering::Acquire) != seq {
+                    std::hint::spin_loop();
+                }
+                let t1 = now_ns();
+                if n >= warmup {
+                    stats.record(t1 - t0, n, t0 - start);
+                }
+                n += 1;
+            }
+            ch.ping.0.store(STOP, Ordering::Release);
+        }
+    }
+    Ok(())
+}
+
+fn echo_loop(endpoint: Endpoint) {
+    match endpoint {
+        Endpoint::Fd { mut rx, mut tx } => {
+            let mut buf = [0u8; 8];
+            while rx.read_exact(&mut buf).is_ok() && u64::from_ne_bytes(buf) != STOP {
+                if tx.write_all(&buf).is_err() {
+                    return;
+                }
+            }
+        }
+        Endpoint::Spin(ch) => {
+            let mut last = 0;
+            loop {
+                let v = ch.ping.0.load(Ordering::Acquire);
+                if v == last {
+                    std::hint::spin_loop();
+                    continue;
+                }
+                if v == STOP {
+                    return;
+                }
+                ch.pong.0.store(v, Ordering::Release);
+                last = v;
+            }
+        }
+    }
+}
+
+/// Crée les deux extrémités : (côté mesure, côté écho).
+fn endpoints(transport: Transport) -> Result<(Endpoint, Endpoint)> {
+    let os_err = |what: &str| format!("{what} : {}", io::Error::last_os_error());
+    // SAFETY : chaque descripteur renvoyé par le noyau est confié à un seul File.
+    unsafe {
+        match transport {
+            Transport::Pipe => {
+                let (mut to_echo, mut to_measure) = ([0i32; 2], [0i32; 2]);
+                if libc::pipe2(to_echo.as_mut_ptr(), libc::O_CLOEXEC) != 0
+                    || libc::pipe2(to_measure.as_mut_ptr(), libc::O_CLOEXEC) != 0
+                {
+                    return Err(os_err("pipe2"));
+                }
+                Ok((
+                    Endpoint::Fd { rx: File::from_raw_fd(to_measure[0]), tx: File::from_raw_fd(to_echo[1]) },
+                    Endpoint::Fd { rx: File::from_raw_fd(to_echo[0]), tx: File::from_raw_fd(to_measure[1]) },
+                ))
+            }
+            Transport::Unix => {
+                let mut fds = [0i32; 2];
+                if libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0, fds.as_mut_ptr()) != 0 {
+                    return Err(os_err("socketpair"));
+                }
+                // une socket sert à la fois en lecture et en écriture : on la duplique
+                let (dup0, dup1) = (libc::dup(fds[0]), libc::dup(fds[1]));
+                if dup0 < 0 || dup1 < 0 {
+                    return Err(os_err("dup"));
+                }
+                Ok((
+                    Endpoint::Fd { rx: File::from_raw_fd(fds[0]), tx: File::from_raw_fd(dup0) },
+                    Endpoint::Fd { rx: File::from_raw_fd(fds[1]), tx: File::from_raw_fd(dup1) },
+                ))
+            }
+            Transport::Spin => {
+                let ch = Arc::new(SpinChannel {
+                    ping: CacheLine(AtomicU64::new(0)),
+                    pong: CacheLine(AtomicU64::new(0)),
+                });
+                Ok((Endpoint::Spin(ch.clone()), Endpoint::Spin(ch)))
+            }
+        }
+    }
+}
+__FIN_FICHIER_17__
+
+ecrire 'src/modes/stall.rs' <<'__FIN_FICHIER_18__'
+//! `rtlat stall` : détecte chaque moment où le cœur est pris au thread.
+//!
+//! Le thread lit l'horloge en boucle. Entre deux lectures consécutives il s'écoule
+//! normalement quelques dizaines de ns ; un écart plus grand que le seuil signifie
+//! que quelque chose a pris le cœur (interruption, tick, SMI, autre tâche, bridage RT).
+//! C'est le principe de `rtla osnoise` / `hwlatdetect`, vu depuis l'espace utilisateur.
+
+use crate::cli::StallArgs;
+use crate::clock::{fmt_ns, now_ns};
+use crate::report::{self, Probe, Run};
+use crate::sched::{self, Policy, ThreadCfg};
+use crate::stats::Stats;
+use crate::system::IrqWatch;
+use crate::{ui, Result};
+
+pub fn run(args: &StallArgs) -> Result<()> {
+    let common = &args.common;
+    // SCHED_OTHER par défaut : une boucle active en RT déclencherait le bridage RT
+    let policy = common.policy.unwrap_or(Policy::Other);
+    report::warn_busy_realtime(policy);
+    let warmup = common.warmup.unwrap_or(0);
+    let thread = ThreadCfg { cpu: common.cpu, policy, prio: common.prio };
+    let duration_ns = common.duration.as_nanos() as u64;
+    let (top, threshold) = (common.top, args.threshold);
+
+    let irqs = IrqWatch::start(common.cpu);
+    let measurement = sched::run_in_thread("rtlat-stall", thread, move || {
+        let mut stats = Stats::new(top, duration_ns);
+        let probe = Probe::start();
+
+        let start = now_ns();
+        let end = start + duration_ns;
+        let (mut previous, mut n) = (start, 0u64);
+        loop {
+            let now = now_ns();
+            let gap = now - previous;
+            if gap > threshold && n >= warmup {
+                stats.record(gap, n, now - start);
+            }
+            previous = now;
+            n += 1;
+            if n % 1024 == 0 && now >= end {
+                break;
+            }
+        }
+
+        let elapsed = previous - start;
+        let stolen = stats.sum() as u64;
+        let notes = vec![
+            ("seuil", fmt_ns(threshold)),
+            (
+                "lectures d'horloge",
+                format!("{} · {:.1} ns en moyenne", ui::count(n), elapsed as f64 / n as f64),
+            ),
+            (
+                "temps volé",
+                format!(
+                    "{} sur {:.3} s ({:.4} %)",
+                    fmt_ns(stolen),
+                    elapsed as f64 / 1e9,
+                    stolen as f64 / elapsed as f64 * 100.0
+                ),
+            ),
+        ];
+        Ok(probe.finish(stats, notes))
+    })?;
+
+    let run = Run {
+        title: "interruptions du thread (durée de chaque trou)",
+        mode: "stall",
+        common,
+        policy,
+        warmup,
+        meta: vec![("threshold_ns", threshold.to_string())],
+    };
+    report::present(&run, &measurement, irqs.finish())
+}
+__FIN_FICHIER_18__
+chmod +x rtlat_plot.py
+
+cat <<'FIN'
+
+Projet créé. Ensuite :
+  cargo build --release        → target/release/rtlat
+  cargo test                   → tests unitaires
+  ./target/release/rtlat --help
+
+En airgap (clap a des dépendances), sur la machine connectée d'abord :
+  mkdir -p .cargo && cargo vendor > .cargo/config.toml
+puis transférer tout le dossier et compiler avec : cargo build --release --offline
+FIN
